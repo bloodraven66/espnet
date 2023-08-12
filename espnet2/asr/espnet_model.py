@@ -200,6 +200,9 @@ class ESPnetASRModel(AbsESPnetModel):
 
         # 1. Encoder
         encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+        if self.encoder.moe:
+            encoder_out, moe_out = encoder_out
+            print(len(moe_out))
         intermediate_outs = None
         if isinstance(encoder_out, tuple):
             intermediate_outs = encoder_out[1]
@@ -275,19 +278,32 @@ class ESPnetASRModel(AbsESPnetModel):
                     encoder_out, encoder_out_lens, text, text_lengths
                 )
 
+            if self.encoder.moe:
+                macaron_moe_loss = self._calc_moe_loss(moe_out[0], moe_out[1])
+                _moe_loss = self._calc_moe_loss(moe_out[2], moe_out[3])
+                
             # 3. CTC-Att loss definition
             if self.ctc_weight == 0.0:
                 loss = loss_att
             elif self.ctc_weight == 1.0:
-                loss = loss_ctc
+                if self.encoder.moe:
+                    loss = loss_ctc + macaron_moe_loss + _moe_loss
+                else:
+                    loss = loss_ctc
             else:
-                loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_att
+                if self.encoder.moe:
+                    loss = self.ctc_weight * (loss_ctc + macaron_moe_loss + _moe_loss) + (1 - self.ctc_weight) * loss_att
+                else:
+                    loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_att
 
             # Collect Attn branch stats
             stats["loss_att"] = loss_att.detach() if loss_att is not None else None
             stats["acc"] = acc_att
             stats["cer"] = cer_att
             stats["wer"] = wer_att
+            if self.encoder.moe:
+                stats["macaron_moe_lb"] = macaron_moe_loss
+                stats["moe_lb"] = _moe_loss
 
         # Collect total loss stats
         stats["loss"] = loss.detach()
@@ -345,11 +361,19 @@ class ESPnetASRModel(AbsESPnetModel):
         # feats: (Batch, Length, Dim)
         # -> encoder_out: (Batch, Length2, Dim2)
         if self.encoder.interctc_use_conditioning:
-            encoder_out, encoder_out_lens, _ = self.encoder(
+            if self.encoder.moe:
+                encoder_out, encoder_out_lens, _, moe_out = self.encoder(
                 feats, feats_lengths, ctc=self.ctc
             )
+            else:
+                encoder_out, encoder_out_lens, _ = self.encoder(
+                    feats, feats_lengths, ctc=self.ctc
+                )
         else:
-            encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_lengths)
+            if self.encoder.moe:
+                encoder_out, encoder_out_lens, _, moe_out = self.encoder(feats, feats_lengths)
+            else:
+                encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_lengths)
         intermediate_outs = None
         if isinstance(encoder_out, tuple):
             intermediate_outs = encoder_out[1]
@@ -372,8 +396,12 @@ class ESPnetASRModel(AbsESPnetModel):
             )
 
         if intermediate_outs is not None:
+            if self.encoder.moe:
+                return (encoder_out, intermediate_outs, moe_out), encoder_out_lens
             return (encoder_out, intermediate_outs), encoder_out_lens
 
+        if self.encoder.moe:
+            return (encoder_out, moe_out), encoder_out_lens
         return encoder_out, encoder_out_lens
 
     def _extract_feats(
@@ -480,6 +508,28 @@ class ESPnetASRModel(AbsESPnetModel):
         assert nll.size(0) == total_num
         return nll
 
+    def _calc_moe_loss(
+        self,
+        expert_probs,
+        expert_chosen,
+    ):
+
+        expert_probs = torch.cat(expert_probs, dim=1)
+        expert_chosen = torch.cat(expert_chosen, dim=1)
+        num_experts = expert_probs.shape[-1]
+        
+        if expert_chosen.dtype != torch.int64:
+            expert_chosen = expert_chosen.to(torch.int64)
+        if len(expert_chosen.shape) == 2:
+            expert_chosen = expert_chosen.unsqueeze(2)
+        expert_mask = torch.nn.functional.one_hot(expert_chosen, num_experts)
+        expert_mask = torch.max(expert_mask, axis=-2).values
+        expert_mask = expert_mask.to(torch.float32)
+        tokens_per_group_and_expert = torch.mean(expert_mask, axis=-2)
+
+        prob_per_group_and_expert = torch.mean(expert_probs, axis=-2)
+        return torch.mean(tokens_per_group_and_expert * prob_per_group_and_expert) * (num_experts**2)
+        
     def _calc_att_loss(
         self,
         encoder_out: torch.Tensor,
