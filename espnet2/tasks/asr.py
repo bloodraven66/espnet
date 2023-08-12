@@ -24,7 +24,7 @@ from espnet2.asr.decoder.transformer_decoder import (
 from espnet2.asr.encoder.abs_encoder import AbsEncoder
 from espnet2.asr.encoder.branchformer_encoder import BranchformerEncoder
 from espnet2.asr.encoder.conformer_encoder import ConformerEncoder
-from espnet2.asr.encoder.multi_gated_conformer_encoder import MultiGatedConformerEncoder
+from espnet2.asr.encoder.conformer_moe_encoder import ConformerEncoderMoe
 from espnet2.asr.encoder.contextual_block_conformer_encoder import (
     ContextualBlockConformerEncoder,
 )
@@ -135,7 +135,7 @@ encoder_choices = ClassChoices(
     "encoder",
     classes=dict(
         conformer=ConformerEncoder,
-        multi_gated_conformer=MultiGatedConformerEncoder,
+        conformer_moe=ConformerEncoderMoe,
         transformer=TransformerEncoder,
         transformer_multispkr=TransformerEncoderMultiSpkr,
         contextual_block_transformer=ContextualBlockTransformerEncoder,
