@@ -142,13 +142,13 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
         if self.gs:
             probs, expert_chosen = gumbel_softmax(probs, mode=self.gs_mode, tau=self.tau)
             if hard_gs_decoding:
-                probs = probs.argmax(-1)
+                argmax_out = probs.argmax(-1)
             if self.gs_mode == "soft":
                 all_expert_outputs = []
                 for expert_idx in range(self.num_experts):
                     
                     if hard_gs_decoding:
-                        if expert_idx != probs.squeeze().item():
+                        if expert_idx != argmax_out.squeeze().item():
                             continue
                         # final_output = self.experts[expert_idx](x) / 2
                         final_output = self.experts[expert_idx](x)
@@ -689,7 +689,6 @@ class ConformerEncoderMoe(AbsEncoder):
                     xs_pad.size(1),
                     limit_size,
                 )
-            print("yes", self.embed)
             xs_pad, masks = self.embed(xs_pad, masks)
         else:
             xs_pad = self.embed(xs_pad)
@@ -702,6 +701,8 @@ class ConformerEncoderMoe(AbsEncoder):
         
         for layer_idx, encoder_layer in enumerate(self.encoders):
             xs_pad, masks, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen) = encoder_layer(xs_pad, masks)
+            # print(expert_probs, expert_chosen)
+            # exit()
             all_macaron_expert_probs.append(macaron_expert_probs)
             all_macaron_expert_chosen.append(macaron_expert_chosen)
             all_expert_probs.append(expert_probs)
@@ -751,7 +752,6 @@ class ConformerEncoderMoe(AbsEncoder):
                     xs_pad.size(1),
                     limit_size,
                 )
-            print("yes", self.embed)
             xs_pad, masks = self.embed(xs_pad, masks)
         else:
             xs_pad = self.embed(xs_pad)

@@ -118,7 +118,7 @@ k2_config=./conf/decode_asr_transformer_with_k2.yaml
 use_streaming=false # Whether to use streaming decoding
 
 use_maskctc=false # Whether to use maskctc decoding
-
+use_moebs_decoding=false 
 batch_size=1
 inference_tag=    # Suffix to the result dir for decoding.
 inference_config= # Config for decoding.
@@ -239,7 +239,7 @@ Options:
     --download_model      # Download a model from Model Zoo and use it for decoding (default="${download_model}").
     --use_streaming       # Whether to use streaming decoding (default="${use_streaming}").
     --use_maskctc         # Whether to use maskctc decoding (default="${use_streaming}").
-
+    --use_moebs_decoding 
     # [Task dependent] Set the datadir name created by local/data.sh
     --train_set     # Name of training set (required).
     --valid_set     # Name of validation set used for monitoring/tuning network training (required).
@@ -1307,6 +1307,8 @@ if ! "${skip_eval}"; then
                 inference_bin_tag="_streaming"
             elif "${use_maskctc}"; then
                 inference_bin_tag="_maskctc"
+            elif "${use_moebs_decoding}"; then
+                inference_bin_tag="_moebsdecoding"
             fi
         fi
 

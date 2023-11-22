@@ -347,41 +347,10 @@ class Speech2Text:
         return results
 
     def _decode_single_sample(self, enc: torch.Tensor, multiple_enc_outputs: bool=False):
-        if self.beam_search_transducer:
-            logging.info("encoder output length: " + str(enc.shape[0]))
-            nbest_hyps = self.beam_search_transducer(enc)
 
-            best = nbest_hyps[0]
-            logging.info(f"total log probability: {best.score:.2f}")
-            logging.info(
-                f"normalized log probability: {best.score / len(best.yseq):.2f}"
-            )
-            logging.info(
-                "best hypo: " + "".join(self.converter.ids2tokens(best.yseq[1:])) + "\n"
-            )
-        elif self.hugging_face_model:
-            decoder_start_token_id = (
-                self.hugging_face_model.config.decoder_start_token_id
-            )
-            yseq = self.hugging_face_model.generate(
-                encoder_outputs=ModelOutput(
-                    last_hidden_state=self.hugging_face_linear_in(enc).unsqueeze(0)
-                ),
-                use_cache=True,
-                decoder_start_token_id=decoder_start_token_id,
-                num_beams=self.hugging_face_beam_size,
-                max_length=self.hugging_face_decoder_max_length,
-            )
-            nbest_hyps = [Hypothesis(yseq=yseq[0])]
-            logging.info(
-                "best hypo: "
-                + "".join(self.converter.ids2tokens(nbest_hyps[0].yseq[1:]))
-                + "\n"
-            )
-        else:
-            nbest_hyps = self.beam_search(
-                x=enc, maxlenratio=self.maxlenratio, minlenratio=self.minlenratio, multiple_enc_outputs=multiple_enc_outputs
-            )
+        nbest_hyps = self.beam_search(
+            x=enc, maxlenratio=self.maxlenratio, minlenratio=self.minlenratio, multiple_enc_outputs=multiple_enc_outputs
+        )
 
         nbest_hyps = nbest_hyps[: self.nbest]
 

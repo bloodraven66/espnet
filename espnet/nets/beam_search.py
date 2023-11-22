@@ -83,7 +83,7 @@ class BeamSearch(torch.nn.Module):
                 self.full_scorers[k] = v
             if isinstance(v, torch.nn.Module):
                 self.nn_dict[k] = v
-
+        print("SACORE", self.full_scorers, scorers, self.part_scorers)
         # set configurations
         self.sos = sos
         self.eos = eos

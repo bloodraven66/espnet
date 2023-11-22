@@ -87,3 +87,9 @@ tools/anaconda
 tools/ice-g2p*
 tools/fairseq*
 tools/featbin*
+plots/
+steps/
+utils/
+../../TEMPLATE/asr1/path.sh
+../../../tools/espnet_aug102023_venv/
+../../respin_moe/
