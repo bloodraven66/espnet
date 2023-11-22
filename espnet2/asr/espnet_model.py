@@ -153,7 +153,9 @@ class ESPnetASRModel(AbsESPnetModel):
                 self.error_calculator = ErrorCalculator(
                     token_list, sym_space, sym_blank, report_cer, report_wer
                 )
-
+        # if hasattr(self.encoder, 'num_conformer_encoders'):
+        
+            
         if ctc_weight == 0.0:
             self.ctc = None
         else:
@@ -165,6 +167,22 @@ class ESPnetASRModel(AbsESPnetModel):
             self.lang_token_id = torch.tensor([[lang_token_id]])
         else:
             self.lang_token_id = None
+        
+        if hasattr(self.encoder, "moe"):
+            if self.encoder.moe:
+                total_count, inference_count, moe_layer_count = 0, 0, 0
+                for name, param in self.encoder.named_parameters():
+                   total_count += param.numel()
+                   if "experts" in name:
+                       moe_layer_count += param.numel()   
+                inference_count = total_count - (moe_layer_count*(self.encoder.num_experts-1)/self.encoder.num_experts)
+                inference_count = round( inference_count / 1_000_000, 2)
+                total_count = round( total_count / 1_000_000, 2)
+                print(f"Training Total Params - {total_count}M")
+                print(moe_layer_count)
+                print(f"Inference Params with {self.encoder.num_experts} experts - {inference_count}M")
+        
+
 
     def forward(
         self,
@@ -201,8 +219,7 @@ class ESPnetASRModel(AbsESPnetModel):
         # 1. Encoder
         encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
         if self.encoder.moe:
-            encoder_out, moe_out = encoder_out
-            print(len(moe_out))
+           encoder_out, moe_out = encoder_out
         intermediate_outs = None
         if isinstance(encoder_out, tuple):
             intermediate_outs = encoder_out[1]
@@ -277,22 +294,27 @@ class ESPnetASRModel(AbsESPnetModel):
                 loss_att, acc_att, cer_att, wer_att = self._calc_att_loss(
                     encoder_out, encoder_out_lens, text, text_lengths
                 )
-
+            moe_loss = 0
             if self.encoder.moe:
-                macaron_moe_loss = self._calc_moe_loss(moe_out[0], moe_out[1])
                 _moe_loss = self._calc_moe_loss(moe_out[2], moe_out[3])
+                moe_loss += _moe_loss
+                stats["moe_lb"] = _moe_loss
+            if self.encoder.macaron_moe:
+                macaron_moe_loss = self._calc_moe_loss(moe_out[0], moe_out[1])
+                moe_loss += macaron_moe_loss
+                stats["macaron_moe_lb"] = macaron_moe_loss
                 
             # 3. CTC-Att loss definition
             if self.ctc_weight == 0.0:
                 loss = loss_att
             elif self.ctc_weight == 1.0:
                 if self.encoder.moe:
-                    loss = loss_ctc + macaron_moe_loss + _moe_loss
+                    loss = loss_ctc + moe_loss
                 else:
                     loss = loss_ctc
             else:
                 if self.encoder.moe:
-                    loss = self.ctc_weight * (loss_ctc + macaron_moe_loss + _moe_loss) + (1 - self.ctc_weight) * loss_att
+                    loss = self.ctc_weight * (loss_ctc + moe_loss) + (1 - self.ctc_weight) * loss_att
                 else:
                     loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_att
 
@@ -301,9 +323,6 @@ class ESPnetASRModel(AbsESPnetModel):
             stats["acc"] = acc_att
             stats["cer"] = cer_att
             stats["wer"] = wer_att
-            if self.encoder.moe:
-                stats["macaron_moe_lb"] = macaron_moe_loss
-                stats["moe_lb"] = _moe_loss
 
         # Collect total loss stats
         stats["loss"] = loss.detach()
@@ -362,6 +381,7 @@ class ESPnetASRModel(AbsESPnetModel):
         # -> encoder_out: (Batch, Length2, Dim2)
         if self.encoder.interctc_use_conditioning:
             if self.encoder.moe:
+                
                 encoder_out, encoder_out_lens, _, moe_out = self.encoder(
                 feats, feats_lengths, ctc=self.ctc
             )
@@ -384,16 +404,28 @@ class ESPnetASRModel(AbsESPnetModel):
             encoder_out, encoder_out_lens = self.postencoder(
                 encoder_out, encoder_out_lens
             )
-
-        assert encoder_out.size(0) == speech.size(0), (
-            encoder_out.size(),
-            speech.size(0),
-        )
-        if getattr(self.encoder, "selfattention_layer_type", None) != "lf_selfattn":
-            assert encoder_out.size(-2) <= encoder_out_lens.max(), (
+        if not hasattr(self.encoder, "num_conformer_encoders"):
+            assert encoder_out.size(0) == speech.size(0), (
                 encoder_out.size(),
-                encoder_out_lens.max(),
+                speech.size(0),
             )
+        else:
+            assert encoder_out[0].size(0) == speech.size(0), (
+                encoder_out[0].size(),
+                speech.size(0),
+            )
+            
+        if getattr(self.encoder, "selfattention_layer_type", None) != "lf_selfattn":
+            if not hasattr(self.encoder, "num_conformer_encoders"):
+                assert encoder_out.size(-2) <= encoder_out_lens.max(), (
+                    encoder_out.size(),
+                    encoder_out_lens.max(),
+                )
+            else:
+                assert encoder_out[0].size(-2) <= encoder_out_lens.max(), (
+                    encoder_out[0].size(),
+                    encoder_out_lens.max(),
+                )
 
         if intermediate_outs is not None:
             if self.encoder.moe:

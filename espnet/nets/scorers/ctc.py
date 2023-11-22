@@ -93,7 +93,12 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
         Returns: initial state
 
         """
-        logp = self.ctc.log_softmax(x.unsqueeze(0))  # assuming batch_size = 1
+        unsqueeze_later = False
+        if isinstance(x, list):
+            unsqueeze_later = True
+        else:
+            x = x.unsqueeze(0)
+        logp = self.ctc.log_softmax(x, unsqueeze_later)  # assuming batch_size = 1
         xlen = torch.tensor([logp.size(1)])
         self.impl = CTCPrefixScoreTH(logp, xlen, 0, self.eos)
         return None

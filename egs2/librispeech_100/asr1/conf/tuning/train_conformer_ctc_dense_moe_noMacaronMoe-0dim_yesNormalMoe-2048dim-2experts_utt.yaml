@@ -15,21 +15,23 @@ encoder_conf:
     output_size: 256
     attention_heads: 4
     linear_units: 2048
+    macaron_style_linear_units: 0
     num_blocks: 18
     dropout_rate: 0.1
     positional_dropout_rate: 0.1
     attention_dropout_rate: 0.1
     input_layer: conv2d
     normalize_before: true
-    macaron_style: true
+    macaron_style: false
     rel_pos_type: latest
     pos_enc_layer_type: rel_pos
     selfattention_layer_type: rel_selfattn
     activation_type: swish
     use_cnn_module: true
     cnn_module_kernel: 31
-    positionwise_layer_type: moe
-    num_experts: 4
+    positionwise_layer_type: utt_moe
+    macaron_positionwise_layer_type: linear
+    num_experts: 2
     capacity_factor: 1.0
     use_load_balancing_loss: true
 

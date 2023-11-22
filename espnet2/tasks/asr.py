@@ -24,6 +24,7 @@ from espnet2.asr.decoder.transformer_decoder import (
 from espnet2.asr.encoder.abs_encoder import AbsEncoder
 from espnet2.asr.encoder.branchformer_encoder import BranchformerEncoder
 from espnet2.asr.encoder.conformer_encoder import ConformerEncoder
+from espnet2.asr.encoder.conformer_encoder2x import ConformerEncoder2x
 from espnet2.asr.encoder.conformer_moe_encoder import ConformerEncoderMoe
 from espnet2.asr.encoder.contextual_block_conformer_encoder import (
     ContextualBlockConformerEncoder,
@@ -135,6 +136,7 @@ encoder_choices = ClassChoices(
     "encoder",
     classes=dict(
         conformer=ConformerEncoder,
+        conformer_2x=ConformerEncoder2x,
         conformer_moe=ConformerEncoderMoe,
         transformer=TransformerEncoder,
         transformer_multispkr=TransformerEncoderMultiSpkr,
@@ -531,10 +533,15 @@ class ASRTask(AbsTask):
             joint_network = None
 
         # 6. CTC
-        ctc = CTC(
-            odim=vocab_size, encoder_output_size=encoder_output_size, **args.ctc_conf
-        )
-
+        if hasattr(encoder, 'num_conformer_encoders'):
+            args.ctc_conf["num_decoders"] = encoder.num_conformer_encoders
+            ctc = CTC(
+                odim=vocab_size, encoder_output_size=encoder_output_size, **args.ctc_conf
+            )
+        else:
+            ctc = CTC(
+                odim=vocab_size, encoder_output_size=encoder_output_size, **args.ctc_conf
+            )
         # 7. Build model
         try:
             model_class = model_choices.get_class(args.model)

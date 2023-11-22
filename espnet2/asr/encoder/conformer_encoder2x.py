@@ -44,7 +44,7 @@ from espnet.nets.pytorch_backend.transformer.subsampling import (
 )
 
 
-class ConformerEncoder(AbsEncoder):
+class ConformerEncoder2x(AbsEncoder):
     """Conformer encoder module.
 
     Args:
@@ -82,6 +82,7 @@ class ConformerEncoder(AbsEncoder):
     def __init__(
         self,
         input_size: int,
+        num_conformer_encoders: int = 2,
         output_size: int = 256,
         attention_heads: int = 4,
         linear_units: int = 2048,
@@ -261,24 +262,34 @@ class ConformerEncoder(AbsEncoder):
                 f"Length of stochastic_depth_rate ({len(stochastic_depth_rate)}) "
                 f"should be equal to num_blocks ({num_blocks})"
             )
-
-        self.encoders = repeat(
-            num_blocks,
-            lambda lnum: EncoderLayer(
-                output_size,
-                encoder_selfattn_layer(*encoder_selfattn_layer_args),
-                positionwise_layer(*positionwise_layer_args),
-                positionwise_layer(*positionwise_layer_args) if macaron_style else None,
-                convolution_layer(*convolution_layer_args) if use_cnn_module else None,
-                dropout_rate,
-                normalize_before,
-                concat_after,
-                stochastic_depth_rate[lnum],
-            ),
-            layer_drop_rate,
-        )
+        encoders = torch.nn.ModuleList()
+        self.num_conformer_encoders = num_conformer_encoders
+        for idx in range(num_conformer_encoders):
+            single_encoder = repeat(
+                num_blocks,
+                lambda lnum: EncoderLayer(
+                    output_size,
+                    encoder_selfattn_layer(*encoder_selfattn_layer_args),
+                    positionwise_layer(*positionwise_layer_args),
+                    positionwise_layer(*positionwise_layer_args) if macaron_style else None,
+                    convolution_layer(*convolution_layer_args) if use_cnn_module else None,
+                    dropout_rate,
+                    normalize_before,
+                    concat_after,
+                    stochastic_depth_rate[lnum],
+                ),
+                layer_drop_rate,
+            )
+            encoders.append(single_encoder)
+        self.encoders = encoders
+        
         if self.normalize_before:
-            self.after_norm = LayerNorm(output_size)
+            after_norm = torch.nn.ModuleList()
+            for idx in range(num_conformer_encoders):
+                
+                after_norm.append(LayerNorm(output_size))
+                
+            self.after_norm = after_norm
 
         self.interctc_layer_idx = interctc_layer_idx
         if len(interctc_layer_idx) > 0:
@@ -333,7 +344,12 @@ class ConformerEncoder(AbsEncoder):
 
         intermediate_outs = []
         if len(self.interctc_layer_idx) == 0:
-            xs_pad, masks = self.encoders(xs_pad, masks)
+            _xs_pad = []
+            for idx in range(len(self.encoders)):
+                xs_pad_, masks_ = self.encoders[idx](xs_pad, masks)
+                _xs_pad.append(xs_pad_)
+            xs_pad = _xs_pad
+            masks = masks_
         else:
             for layer_idx, encoder_layer in enumerate(self.encoders):
                 xs_pad, masks = encoder_layer(xs_pad, masks)
@@ -359,11 +375,15 @@ class ConformerEncoder(AbsEncoder):
                         else:
                             xs_pad = xs_pad + self.conditioning_layer(ctc_out)
 
-        if isinstance(xs_pad, tuple):
-            xs_pad = xs_pad[0]
+        
         if self.normalize_before:
-            xs_pad = self.after_norm(xs_pad)
-
+            _xs_pad = []
+            for idx in range(len(self.after_norm)):
+                if isinstance(xs_pad[idx], tuple):
+                    ip = xs_pad[idx][0]
+                xs_pad_ = self.after_norm[idx](ip)
+                _xs_pad.append(xs_pad_)
+            xs_pad = _xs_pad
         olens = masks.squeeze(1).sum(1)
         if len(intermediate_outs) > 0:
             return (xs_pad, intermediate_outs), olens, None

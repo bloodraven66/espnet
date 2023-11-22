@@ -130,7 +130,7 @@ class Trainer:
         schedulers: Sequence[Optional[AbsScheduler]],
         scaler: Optional[GradScaler],
         ngpu: int = 0,
-    ):
+    ):  
         states = torch.load(
             checkpoint,
             map_location=f"cuda:{torch.cuda.current_device()}" if ngpu > 0 else "cpu",
@@ -337,6 +337,10 @@ class Trainer:
                     reporter.wandb_log()
 
                 # 4. Save/Update the checkpoint
+                import shutil
+                import os
+                if os.path.exists(output_dir / "checkpoint.pth"):
+                    shutil.copyfile(output_dir / "checkpoint.pth", output_dir / "checkpoint_prev.pth")
                 torch.save(
                     {
                         "model": model.state_dict(),

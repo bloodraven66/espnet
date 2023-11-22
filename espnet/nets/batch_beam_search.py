@@ -118,13 +118,17 @@ class BatchBeamSearch(BeamSearch):
         for k, d in self.scorers.items():
             init_states[k] = d.batch_init_state(x)
             init_scores[k] = 0.0
+        if isinstance(x, list):
+            device = x[0].device
+        else:
+            device = x.device
         return self.batchfy(
             [
                 Hypothesis(
                     score=0.0,
                     scores=init_scores,
                     states=init_states,
-                    yseq=torch.tensor([self.sos], device=x.device),
+                    yseq=torch.tensor([self.sos], device=device),
                 )
             ]
         )
@@ -213,10 +217,22 @@ class BatchBeamSearch(BeamSearch):
         n_batch = len(running_hyps)
         part_ids = None  # no pre-beam
         # batch scoring
+        if isinstance(x, list):
+            dtype = x[0].dtype
+            device = x[0].device
+            shape = x[0].shape
+        else:
+            dtype = x.dtype
+            device = x.device
+            shape = x.shape
+        
         weighted_scores = torch.zeros(
-            n_batch, self.n_vocab, dtype=x.dtype, device=x.device
+            n_batch, self.n_vocab, dtype=dtype, device=device
         )
-        scores, states = self.score_full(running_hyps, x.expand(n_batch, *x.shape))
+        if not isinstance(x, list):
+            scores, states = self.score_full(running_hyps, x.expand(n_batch, *shape))
+        else:
+            scores, states = self.score_full(running_hyps, [xx.expand(n_batch, *shape) for xx in x])
         for k in self.full_scorers:
             weighted_scores += self.weights[k] * scores[k]
         # partial scoring
@@ -235,7 +251,7 @@ class BatchBeamSearch(BeamSearch):
             weighted_scores += self.weights[k] * part_scores[k]
         # add previous hyp scores
         weighted_scores += running_hyps.score.to(
-            dtype=x.dtype, device=x.device
+            dtype=dtype, device=device
         ).unsqueeze(1)
 
         # TODO(karita): do not use list. use batch instead

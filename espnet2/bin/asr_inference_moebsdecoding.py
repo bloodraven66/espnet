@@ -44,6 +44,15 @@ try:
 except ImportError:
     is_transformers_available = False
 
+from packaging.version import parse as V
+if V(torch.__version__) >= V("1.6.0"):
+    from torch.cuda.amp import autocast
+else:
+    # Nothing to do if torch<1.6.0
+    @contextmanager
+    def autocast(enabled=True):
+        yield
+
 
 class Speech2Text:
     """Speech2Text class
@@ -111,18 +120,6 @@ class Speech2Text:
         asr_model, asr_train_args = task.build_model_from_file(
             asr_train_config, asr_model_file, device
         )
-        if enh_s2t_task:
-            asr_model.inherite_attributes(
-                inherite_s2t_attrs=[
-                    "ctc",
-                    "decoder",
-                    "eos",
-                    "joint_network",
-                    "sos",
-                    "token_list",
-                    "use_transducer_decoder",
-                ]
-            )
         asr_model.to(dtype=getattr(torch, dtype)).eval()
 
         if quantize_asr_model:
@@ -172,127 +169,79 @@ class Speech2Text:
         scorers["ngram"] = ngram
 
         # 4. Build BeamSearch object
-        if asr_model.use_transducer_decoder:
-            beam_search_transducer = BeamSearchTransducer(
-                decoder=asr_model.decoder,
-                joint_network=asr_model.joint_network,
+        
+        beam_search_transducer = None
+        hugging_face_model = None
+        hugging_face_linear_in = None
+
+        weights = dict(
+            decoder=1.0 - ctc_weight,
+            ctc=ctc_weight,
+            lm=lm_weight,
+            ngram=ngram_weight,
+            length_bonus=penalty,
+        )
+
+        if time_sync:
+            if not hasattr(asr_model, "ctc"):
+                raise NotImplementedError(
+                    "BeamSearchTimeSync without CTC is not supported."
+                )
+            if batch_size != 1:
+                raise NotImplementedError(
+                    "BeamSearchTimeSync with batching is not yet supported."
+                )
+            logging.info("BeamSearchTimeSync implementation is selected.")
+
+            scorers["ctc"] = asr_model.ctc
+            beam_search = BeamSearchTimeSync(
                 beam_size=beam_size,
-                lm=scorers["lm"] if "lm" in scorers else None,
-                lm_weight=lm_weight,
+                weights=weights,
+                scorers=scorers,
+                sos=asr_model.sos,
                 token_list=token_list,
-                **transducer_conf,
             )
-            beam_search = None
-            hugging_face_model = None
-            hugging_face_linear_in = None
-        elif (
-            decoder.__class__.__name__ == "HuggingFaceTransformersDecoder"
-            and hugging_face_decoder
-        ):
-            if not is_transformers_available:
-                raise ImportError(
-                    "`transformers` is not available."
-                    " Please install it via `pip install transformers`"
-                    " or `cd /path/to/espnet/tools && . ./activate_python.sh"
-                    " && ./installers/install_transformers.sh`."
-                )
-
-            hugging_face_model = AutoModelForSeq2SeqLM.from_pretrained(
-                decoder.model_name_or_path
-            )
-
-            hugging_face_model.lm_head.load_state_dict(decoder.lm_head.state_dict())
-
-            if hasattr(hugging_face_model, "model"):
-                hugging_face_model.model.decoder.load_state_dict(
-                    decoder.decoder.state_dict()
-                )
-                del hugging_face_model.model.encoder
-            else:
-                hugging_face_model.decoder.load_state_dict(decoder.decoder.state_dict())
-                del hugging_face_model.encoder
-
-            del asr_model.decoder.lm_head
-            del asr_model.decoder.decoder
-
-            hugging_face_linear_in = decoder.linear_in
-            hugging_face_model.to(device=device).eval()
-
-            beam_search = None
-            beam_search_transducer = None
         else:
-            beam_search_transducer = None
-            hugging_face_model = None
-            hugging_face_linear_in = None
-
-            weights = dict(
-                decoder=1.0 - ctc_weight,
-                ctc=ctc_weight,
-                lm=lm_weight,
-                ngram=ngram_weight,
-                length_bonus=penalty,
+            beam_search = BeamSearch(
+                beam_size=beam_size,
+                weights=weights,
+                scorers=scorers,
+                sos=asr_model.sos,
+                eos=asr_model.eos,
+                vocab_size=len(token_list),
+                token_list=token_list,
+                pre_beam_score_key=None if ctc_weight == 1.0 else "full",
             )
 
-            if time_sync:
-                if not hasattr(asr_model, "ctc"):
-                    raise NotImplementedError(
-                        "BeamSearchTimeSync without CTC is not supported."
-                    )
-                if batch_size != 1:
-                    raise NotImplementedError(
-                        "BeamSearchTimeSync with batching is not yet supported."
-                    )
-                logging.info("BeamSearchTimeSync implementation is selected.")
-
-                scorers["ctc"] = asr_model.ctc
-                beam_search = BeamSearchTimeSync(
-                    beam_size=beam_size,
-                    weights=weights,
-                    scorers=scorers,
-                    sos=asr_model.sos,
-                    token_list=token_list,
-                )
-            else:
-                beam_search = BeamSearch(
-                    beam_size=beam_size,
-                    weights=weights,
-                    scorers=scorers,
-                    sos=asr_model.sos,
-                    eos=asr_model.eos,
-                    vocab_size=len(token_list),
-                    token_list=token_list,
-                    pre_beam_score_key=None if ctc_weight == 1.0 else "full",
-                )
-
-                # TODO(karita): make all scorers batchfied
-                if batch_size == 1:
-                    non_batch = [
-                        k
-                        for k, v in beam_search.full_scorers.items()
-                        if not isinstance(v, BatchScorerInterface)
-                    ]
-                    if len(non_batch) == 0:
-                        if streaming:
-                            beam_search.__class__ = BatchBeamSearchOnlineSim
-                            beam_search.set_streaming_config(asr_train_config)
-                            logging.info(
-                                "BatchBeamSearchOnlineSim implementation is selected."
-                            )
-                        else:
-                            beam_search.__class__ = BatchBeamSearch
-                            logging.info("BatchBeamSearch implementation is selected.")
-                    else:
-                        logging.warning(
-                            f"As non-batch scorers {non_batch} are found, "
-                            f"fall back to non-batch implementation."
+            # TODO(karita): make all scorers batchfied
+            if batch_size == 1:
+                non_batch = [
+                    k
+                    for k, v in beam_search.full_scorers.items()
+                    if not isinstance(v, BatchScorerInterface)
+                ]
+                if len(non_batch) == 0:
+                    if streaming:
+                        beam_search.__class__ = BatchBeamSearchOnlineSim
+                        beam_search.set_streaming_config(asr_train_config)
+                        logging.info(
+                            "BatchBeamSearchOnlineSim implementation is selected."
                         )
+                    else:
+                        beam_search.__class__ = BatchBeamSearch
+                        logging.info("BatchBeamSearch implementation is selected.")
+                else:
+                    logging.warning(
+                        f"As non-batch scorers {non_batch} are found, "
+                        f"fall back to non-batch implementation."
+                    )
 
-            beam_search.to(device=device, dtype=getattr(torch, dtype)).eval()
-            for scorer in scorers.values():
-                if isinstance(scorer, torch.nn.Module):
-                    scorer.to(device=device, dtype=getattr(torch, dtype)).eval()
-            logging.info(f"Beam_search: {beam_search}")
-            logging.info(f"Decoding device={device}, dtype={dtype}")
+        beam_search.to(device=device, dtype=getattr(torch, dtype)).eval()
+        for scorer in scorers.values():
+            if isinstance(scorer, torch.nn.Module):
+                scorer.to(device=device, dtype=getattr(torch, dtype)).eval()
+        logging.info(f"Beam_search: {beam_search}")
+        logging.info(f"Decoding device={device}, dtype={dtype}")
 
         # 5. [Optional] Build Text converter: e.g. bpe-sym -> Text
         if token_type is None:
@@ -354,66 +303,47 @@ class Speech2Text:
         # Input as audio signal
         if isinstance(speech, np.ndarray):
             speech = torch.tensor(speech)
-
-        # data: (Nsamples,) -> (1, Nsamples)
         speech = speech.unsqueeze(0).to(getattr(torch, self.dtype))
-        # lengths: (1,)
-        lengths = speech.new_full([1], dtype=torch.long, fill_value=speech.size(1))
-        batch = {"speech": speech, "speech_lengths": lengths}
+        speech_lengths = speech.new_full([1], dtype=torch.long, fill_value=speech.size(1))
+        batch = {"speech": speech, "speech_lengths": speech_lengths}
         logging.info("speech length: " + str(speech.size(1)))
-
-        # a. To device
         batch = to_device(batch, device=self.device)
-
-        # b. Forward Encoder
-        enc, _ = self.asr_model.encode(**batch)
-        if self.multi_asr:
-            enc = enc.unbind(dim=1)  # (batch, num_inf, ...) -> num_inf x [batch, ...]
-        if self.enh_s2t_task or self.multi_asr:
-            # Enh+ASR joint task or Multispkr ASR task
-            # NOTE (Wangyou): the return type in this case is List[default_return_type]
-            if self.multi_asr:
-                num_spk = getattr(self.asr_model, "num_inf", 1)
-            else:
-                num_spk = getattr(self.asr_model.enh_model, "num_spk", 1)
-            assert len(enc) == num_spk, (len(enc), num_spk)
-            results = []
-            for spk, enc_spk in enumerate(enc, 1):
-                logging.info(f"=== [{str(self.asr_model.__class__)}] Speaker {spk} ===")
-                if isinstance(enc_spk, tuple):
-                    enc_spk = enc_spk[0]
-                assert len(enc_spk) == 1, len(enc_spk)
-
-                # c. Passed the encoder result and the beam search
-                ret = self._decode_single_sample(enc_spk[0])
-                assert check_return_type(ret)
-                results.append(ret)
-
-        else:
-
-            # Normal ASR
-            if isinstance(enc, tuple):
-                
-                # a = torch.stack(enc[-1][3]).squeeze().tolist()
-                # import matplotlib.pyplot as plt
-                # plt.scatter([i for i in range(18)], a)
-                # plt.xlabel("encoder layers ->")
-                # plt.ylabel("expert chosen (0/1)")
-                # plt.xticks([i for i in range(18)], [i for i in range(18)])
-                # plt.yticks([0, 1], [0, 1])
-                # plt.savefig("plots/example_moe_experts_chosen.png")
-                
-                # exit()
-                enc = enc[0]
-            if not hasattr(self.asr_model.encoder, "num_conformer_encoders"):
-                assert len(enc) == 1, len(enc)
-                results = self._decode_single_sample(enc[0])
-            # c. Passed the encoder result and the beam search
-            else:
-                results = self._decode_single_sample(enc, multiple_enc_outputs=True)
+        # enc, _ = self.asr_model.encode(**batch)
+        
+        
+        #####
+        
+        with autocast(False):
+            feats, feats_lengths = self.asr_model._extract_feats(batch["speech"], batch["speech_lengths"])
+            if self.asr_model.normalize is not None:
+                feats, feats_lengths = self.asr_model.normalize(feats, feats_lengths)
+        if self.asr_model.preencoder is not None:
+            feats, feats_lengths = self.asr_model.preencoder(feats, feats_lengths)
             
-            assert check_return_type(results)
+        encoder_out, encoder_out_lens, _, moe_out = self.asr_model.encoder.bs_decoder(feats, feats_lengths)
 
+        if self.asr_model.postencoder is not None:
+            encoder_out, encoder_out_lens = self.asr_model.postencoder(
+                encoder_out, encoder_out_lens
+            )
+        assert encoder_out.size(0) == speech.size(0), (
+            encoder_out.size(),
+            speech.size(0),)
+            
+        if getattr(self.asr_model.encoder, "selfattention_layer_type", None) != "lf_selfattn":
+            assert encoder_out.size(-2) <= encoder_out_lens.max(), (
+                encoder_out.size(),
+                encoder_out_lens.max(),
+            )
+           
+
+        enc, _ = (encoder_out, moe_out), encoder_out_lens
+        #####
+        
+        enc = enc[0]
+        assert len(enc) == 1, len(enc)
+        results = self._decode_single_sample(enc[0])
+        assert check_return_type(results)
         return results
 
     def _decode_single_sample(self, enc: torch.Tensor, multiple_enc_outputs: bool=False):
@@ -551,6 +481,7 @@ def inference(
     hugging_face_decoder_max_length: int,
     time_sync: bool,
     multi_asr: bool,
+    moe_beam_size: int,
 ):
     assert check_argument_types()
     if batch_size > 1:
@@ -883,6 +814,13 @@ def get_parser():
         default=False,
         help="Time synchronous beam search.",
     )
+    group.add_argument(
+        "--moe_beam_size",
+        type=int,
+        default=None,
+        help="Time synchronous beam search.",
+    )
+    
 
     return parser
 

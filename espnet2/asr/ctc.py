@@ -25,12 +25,21 @@ class CTC(torch.nn.Module):
         reduce: bool = True,
         ignore_nan_grad: bool = None,
         zero_infinity: bool = True,
+        num_decoders: int = 1,
     ):
         assert check_argument_types()
         super().__init__()
         eprojs = encoder_output_size
         self.dropout_rate = dropout_rate
-        self.ctc_lo = torch.nn.Linear(eprojs, odim)
+        self.num_decoders = num_decoders
+        if num_decoders == 1:
+            self.ctc_lo = torch.nn.Linear(eprojs, odim)
+        else:
+            ctc_lo = torch.nn.ModuleList()
+            for idx in range(num_decoders):
+                ctc_lo.append(torch.nn.Linear(eprojs, odim))
+            self.ctc_lo = ctc_lo
+            
         self.ctc_type = ctc_type
         if ignore_nan_grad is not None:
             zero_infinity = ignore_nan_grad
@@ -51,10 +60,20 @@ class CTC(torch.nn.Module):
 
     def loss_fn(self, th_pred, th_target, th_ilen, th_olen) -> torch.Tensor:
         if self.ctc_type == "builtin":
-            th_pred = th_pred.log_softmax(2)
-            loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
-            size = th_pred.size(1)
-
+            if self.num_decoders == 1:
+                th_pred = th_pred.log_softmax(2)
+                loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
+                size = th_pred.size(1)
+            else:
+                _th_pred = []
+                for idx in range(self.num_decoders):
+                    th_pred_ = th_pred[idx].softmax(2)
+                    _th_pred.append(th_pred_)
+                th_pred = torch.stack(_th_pred, -1) 
+                th_pred = torch.mean(th_pred, -1) 
+                th_pred = th_pred.log()
+                size = th_pred.size(1)
+                loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
             if self.reduce:
                 # Batch-size average
                 loss = loss.sum() / size
@@ -79,19 +98,39 @@ class CTC(torch.nn.Module):
             ys_lens: batch of lengths of character sequence (B)
         """
         # hs_pad: (B, L, NProj) -> ys_hat: (B, L, Nvocab)
-        ys_hat = self.ctc_lo(F.dropout(hs_pad, p=self.dropout_rate))
-
+        
+        if self.num_decoders == 1:
+            ys_hat = self.ctc_lo(F.dropout(hs_pad, p=self.dropout_rate))
+            device = hs_pad.device
+            dtype = hs_pad.dtype
+        else:
+            ys_hat_ = []
+            for idx in range(len(self.ctc_lo)):
+                _ys_hat = self.ctc_lo[idx](F.dropout(hs_pad[idx], p=self.dropout_rate))
+                ys_hat_.append(_ys_hat)
+            device = _ys_hat.device
+            dtype = _ys_hat.dtype
+            ys_hat = ys_hat_
+            
+    
         if self.ctc_type == "gtnctc":
             # gtn expects list form for ys
             ys_true = [y[y != -1] for y in ys_pad]  # parse padded ys
         else:
             # ys_hat: (B, L, D) -> (L, B, D)
-            ys_hat = ys_hat.transpose(0, 1)
+            if self.num_decoders == 1:
+                ys_hat = ys_hat.transpose(0, 1)
+            else:
+                ys_hat_ = []
+                for idx in range(len(self.ctc_lo)):
+                    _ys_hat = ys_hat[idx].transpose(0, 1)
+                    ys_hat_.append(_ys_hat)
+                ys_hat = ys_hat_
             # (B, L) -> (BxL,)
             ys_true = torch.cat([ys_pad[i, :l] for i, l in enumerate(ys_lens)])
 
         loss = self.loss_fn(ys_hat, ys_true, hlens, ys_lens).to(
-            device=hs_pad.device, dtype=hs_pad.dtype
+            device=device, dtype=dtype
         )
 
         return loss
@@ -106,7 +145,7 @@ class CTC(torch.nn.Module):
         """
         return F.softmax(self.ctc_lo(hs_pad), dim=2)
 
-    def log_softmax(self, hs_pad):
+    def log_softmax(self, hs_pad, unsqueeze_later=False):
         """log_softmax of frame activations
 
         Args:
@@ -114,8 +153,21 @@ class CTC(torch.nn.Module):
         Returns:
             torch.Tensor: log softmax applied 3d tensor (B, Tmax, odim)
         """
-        return F.log_softmax(self.ctc_lo(hs_pad), dim=2)
-
+        
+        if self.num_decoders == 1:
+            return F.log_softmax(self.ctc_lo(hs_pad), dim=2)
+        ys_hat_ = []
+        for idx in range(len(self.ctc_lo)):
+            if unsqueeze_later:
+                x = hs_pad[idx].unsqueeze(0)
+            else:
+                x = hs_pad[idx]
+            _ys_hat = self.ctc_lo[idx](x).softmax(2)
+            ys_hat_.append(_ys_hat)
+        ys_hat = torch.stack(ys_hat_, -1)
+        ys_hat = torch.mean(ys_hat, -1)
+        return ys_hat.log()
+    
     def argmax(self, hs_pad):
         """argmax of frame activations
 
@@ -124,4 +176,13 @@ class CTC(torch.nn.Module):
         Returns:
             torch.Tensor: argmax applied 2d tensor (B, Tmax)
         """
-        return torch.argmax(self.ctc_lo(hs_pad), dim=2)
+        if self.num_decoders == 1:
+            return torch.argmax(self.ctc_lo(hs_pad), dim=2)
+                
+        ys_hat_ = []
+        for idx in range(len(self.ctc_lo)):
+            _ys_hat = self.ctc_lo[idx](hs_pad[idx]).softmax(2)
+            ys_hat_.append(_ys_hat)
+        ys_hat = torch.stack(ys_hat_, -1)
+        ys_hat = torch.mean(ys_hat, -1)
+        return torch.argmax(ys_hat, dim=2)

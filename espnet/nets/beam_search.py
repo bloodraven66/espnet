@@ -328,7 +328,7 @@ class BeamSearch(torch.nn.Module):
         return best_hyps
 
     def forward(
-        self, x: torch.Tensor, maxlenratio: float = 0.0, minlenratio: float = 0.0
+        self, x: torch.Tensor, maxlenratio: float = 0.0, minlenratio: float = 0.0, multiple_enc_outputs: bool=False,
     ) -> List[Hypothesis]:
         """Perform beam search.
 
@@ -347,13 +347,21 @@ class BeamSearch(torch.nn.Module):
         """
         # set length bounds
         if maxlenratio == 0:
-            maxlen = x.shape[0]
+            if multiple_enc_outputs:
+                x = [xx.squeeze() for xx in x]
+                maxlen = x[0].shape[0]
+            else:
+                maxlen = x.shape[0]
         elif maxlenratio < 0:
             maxlen = -1 * int(maxlenratio)
         else:
             maxlen = max(1, int(maxlenratio * x.size(0)))
-        minlen = int(minlenratio * x.size(0))
-        logging.info("decoder input length: " + str(x.shape[0]))
+        if multiple_enc_outputs:
+            logging.info("decoder input length: " + str(x[0].shape[0]))
+            minlen = int(minlenratio * x[0].size(0))
+        else:
+            minlen = int(minlenratio * x.size(0))
+            logging.info("decoder input length: " + str(x.shape[0]))
         logging.info("max output length: " + str(maxlen))
         logging.info("min output length: " + str(minlen))
 
@@ -403,7 +411,11 @@ class BeamSearch(torch.nn.Module):
                 + "".join([self.token_list[x] for x in best.yseq[1:-1]])
                 + "\n"
             )
-        if best.yseq[1:-1].shape[0] == x.shape[0]:
+        if isinstance(x, list):
+            sh = x[0].shape[0]
+        else:
+            sh = x.shape[0]
+        if best.yseq[1:-1].shape[0] == sh:
             logging.warning(
                 "best hypo length: {} == max output length: {}".format(
                     best.yseq[1:-1].shape[0], maxlen
