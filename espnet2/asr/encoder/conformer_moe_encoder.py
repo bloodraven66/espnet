@@ -135,7 +135,7 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
         self.tau = tau
         assert gs_mode in ["soft"], f'{gs_mode}'
         
-    def forward(self, x, change_expert=None, hard_gs_decoding=True):
+    def forward(self, x, change_expert=None, hard_gs_decoding=False):
         """Forward function."""
         bs, ts, dim = x.shape            
         probs = self.softmax(self.expert_predictor(torch.mean(x, 1)))
@@ -143,6 +143,8 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
             probs, expert_chosen = gumbel_softmax(probs, mode=self.gs_mode, tau=self.tau)
             if hard_gs_decoding:
                 argmax_out = probs.argmax(-1)
+                if change_expert is not None:
+                    argmax_out = torch.full(argmax_out.shape, fill_value=change_expert, device=argmax_out.device, dtype=argmax_out.dtype)
             if self.gs_mode == "soft":
                 all_expert_outputs = []
                 for expert_idx in range(self.num_experts):
@@ -178,6 +180,47 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
         # final_output = final_output.view(bs, ts, dim)
         # print(probs)
         return final_output, probs.view(bs, -1), expert_chosen.view(bs, -1)
+    
+    def bs_decoder(self, x, local_bw, expert_history, expert_idx_history, residual):
+        bs, ts, dim = x.shape            
+        probs = self.softmax(self.expert_predictor(torch.mean(x, 1)))
+        probs, expert_chosen = gumbel_softmax(probs, mode=self.gs_mode, tau=self.tau)
+        num_experts = probs.shape[-1]
+        local_topk_out = torch.topk(probs, min(local_bw, num_experts), -1)
+        local_topk_values = torch.log(local_topk_out.values.squeeze())
+        local_topk_indices = local_topk_out.indices.squeeze().int().tolist()
+        
+
+        rename = False
+        if expert_history is None:
+            expert_history = [local_topk_values]
+            expert_idx_history = [[(idx, x) for idx, x in enumerate(local_topk_indices)]]
+            x = x.repeat(min(local_bw, num_experts), 1, 1)
+            residual = residual.repeat(min(local_bw, num_experts), 1, 1)
+        else:
+            global_values = torch.stack([torch.add(x, y) for x in expert_history[-1] for y in local_topk_values[-1]], 0)
+            global_ids = [(expert_idx_history[-1][x][0], local_topk_indices[-1][y]) for x in range(len(expert_history[-1])) for y in range(len(local_topk_values[-1]))]
+            
+            global_topk_out = torch.topk(global_values, min(local_bw, len(global_values)), -1)
+            global_topk_indices = global_topk_out.indices.int().tolist()
+            global_topk_values = global_topk_out.values
+            selected_ids = [global_ids[x] for x in global_topk_indices]
+            expert_idx_history.append(selected_ids)
+            expert_history.append(global_topk_values)
+            rename = True
+        res_ = []
+        residual_ = []
+        for idx in expert_idx_history[-1]:
+            if idx == -1: continue
+            x_idx, expert_idx = idx
+            residual_.append(residual[x_idx])
+            res = self.experts[expert_idx](x[x_idx])
+            res_.append(res)
+        if rename:
+            expert_idx_history[-1] = [(idx, x) for idx, x in enumerate(global_topk_indices)]
+        residual = torch.stack(residual_, 0)
+        final_output = torch.stack(res_, 0)
+        return final_output, expert_history, expert_idx_history, residual
     
 class ConformerMoEEncoderLayer(torch.nn.Module):
     """Encoder layer module.
@@ -334,6 +377,7 @@ class ConformerMoEEncoderLayer(torch.nn.Module):
 
         # feed forward module
         residual = x
+        
         if self.normalize_before:
             x = self.norm_ff(x)
         if self.moe:
@@ -355,6 +399,74 @@ class ConformerMoEEncoderLayer(torch.nn.Module):
             return (x, pos_emb), mask, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen)
 
         return x, mask, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen)
+
+    def bs_decoder(self, x_input, mask, local_bw, cache=None, expert_history=None, expert_idx_history=None):
+        
+        if isinstance(x_input, tuple):
+            x, pos_emb = x_input[0], x_input[1]
+        else:
+            x, pos_emb = x_input, None
+
+        stoch_layer_coeff = 1.0
+
+        if self.feed_forward_macaron is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.norm_ff_macaron(x)
+            x = self.feed_forward_macaron(x)
+            x = residual + stoch_layer_coeff * self.ff_scale * self.dropout(x)
+            if not self.normalize_before:
+                x = self.norm_ff_macaron(x)
+
+        residual = x
+        if self.normalize_before:
+            x = self.norm_mha(x)
+            
+        x_q = x
+
+        if pos_emb is not None:
+            x_att = self.self_attn(x_q, x, x, pos_emb, mask)
+        else:
+            x_att = self.self_attn(x_q, x, x, mask)
+
+        if self.concat_after:
+            x_concat = torch.cat((x, x_att), dim=-1)
+            x = residual + stoch_layer_coeff * self.concat_linear(x_concat)
+        else:
+            x = residual + stoch_layer_coeff * self.dropout(x_att)
+            
+        if not self.normalize_before:
+            x = self.norm_mha(x)
+
+        if self.conv_module is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.norm_conv(x)
+            x = residual + stoch_layer_coeff * self.dropout(self.conv_module(x))
+            if not self.normalize_before:
+                x = self.norm_conv(x)
+
+        residual = x
+        if self.normalize_before:
+            x = self.norm_ff(x)
+            
+        x, expert_history, expert_idx_history, residual = self.feed_forward.bs_decoder(x, local_bw=local_bw, expert_history=expert_history, expert_idx_history=expert_idx_history, residual=residual) 
+        x = residual + stoch_layer_coeff * self.ff_scale * self.dropout(x)
+        if not self.normalize_before:
+            x = self.norm_ff(x)
+
+        if self.conv_module is not None:
+            x = self.norm_final(x)
+
+        if cache is not None:
+            x = torch.cat([cache, x], dim=1)
+
+        if pos_emb is not None:
+            return (x, pos_emb), mask, expert_history, expert_idx_history
+
+        return x, mask, (macaron_expert_probs, macaron_expert_chosen), (expert_history, expert_idx_history)
+    
+        
     
 class ConformerEncoderMoe(AbsEncoder):
     """Conformer encoder module.
@@ -672,6 +784,7 @@ class ConformerEncoderMoe(AbsEncoder):
         self,
         xs_pad: torch.Tensor,
         ilens: torch.Tensor,
+        bw,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         
         masks = (~make_pad_mask(ilens)[:, None, :]).to(xs_pad.device)
@@ -698,15 +811,10 @@ class ConformerEncoderMoe(AbsEncoder):
         all_macaron_expert_chosen = []
         all_expert_probs = []
         all_expert_chosen = []
-        
+        expert_idx_history = None
+        expert_history = None
         for layer_idx, encoder_layer in enumerate(self.encoders):
-            xs_pad, masks, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen) = encoder_layer(xs_pad, masks)
-            # print(expert_probs, expert_chosen)
-            # exit()
-            all_macaron_expert_probs.append(macaron_expert_probs)
-            all_macaron_expert_chosen.append(macaron_expert_chosen)
-            all_expert_probs.append(expert_probs)
-            all_expert_chosen.append(expert_chosen)
+            xs_pad, masks, expert_history, expert_idx_history = encoder_layer.bs_decoder(xs_pad, masks, local_bw=bw, expert_idx_history=expert_idx_history, expert_history=expert_history)
         
         if isinstance(xs_pad, tuple):
             xs_pad = xs_pad[0]

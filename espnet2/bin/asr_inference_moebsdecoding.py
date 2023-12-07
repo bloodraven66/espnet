@@ -319,13 +319,18 @@ class Speech2Text:
                 feats, feats_lengths = self.asr_model.normalize(feats, feats_lengths)
         if self.asr_model.preencoder is not None:
             feats, feats_lengths = self.asr_model.preencoder(feats, feats_lengths)
-            
-        encoder_out, encoder_out_lens, _, moe_out = self.asr_model.encoder.bs_decoder(feats, feats_lengths)
+        
+        bw = 6
+        encoder_out, encoder_out_lens, _, moe_out = self.asr_model.encoder.bs_decoder(feats, feats_lengths, bw)
 
         if self.asr_model.postencoder is not None:
             encoder_out, encoder_out_lens = self.asr_model.postencoder(
                 encoder_out, encoder_out_lens
             )
+
+        encoder_out = encoder_out[5].unsqueeze(0)
+        
+        
         assert encoder_out.size(0) == speech.size(0), (
             encoder_out.size(),
             speech.size(0),)
@@ -337,17 +342,15 @@ class Speech2Text:
             )
            
 
-        enc, _ = (encoder_out, moe_out), encoder_out_lens
+        enc = encoder_out
         #####
         
-        enc = enc[0]
         assert len(enc) == 1, len(enc)
         results = self._decode_single_sample(enc[0])
         assert check_return_type(results)
         return results
 
     def _decode_single_sample(self, enc: torch.Tensor, multiple_enc_outputs: bool=False):
-
         nbest_hyps = self.beam_search(
             x=enc, maxlenratio=self.maxlenratio, minlenratio=self.minlenratio, multiple_enc_outputs=multiple_enc_outputs
         )

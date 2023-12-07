@@ -7,7 +7,7 @@ set -o pipefail
 
 train_set="train_libri_100h"
 valid_set="dev_clean"
-test_sets="test_clean"
+test_sets="test_clean test_other"
 # dev_clean dev_other"
 #test_sets="test_clean"
 
@@ -34,6 +34,6 @@ inference_config=conf/decode_asr_moebs.yaml
     --test_sets "${test_sets}" \
     --inference_asr_model "valid.cer_ctc.ave_10best.pth" \
     --lm_train_text "data/${train_set}/text" \
-    --inference_tag "hard_bs_width2" \
+    --inference_tag "hard_bs_width6_5" \
     --use_moebs_decoding true \
     --bpe_train_text "data/${train_set}/text" "$@" 

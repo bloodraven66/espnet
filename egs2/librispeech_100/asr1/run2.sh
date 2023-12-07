@@ -7,8 +7,8 @@ set -o pipefail
 
 train_set="train_libri_100h"
 valid_set="dev_clean"
-# test_sets="test_clean test_other"
-test_sets="test_other"
+test_sets="test_clean test_other"
+# test_sets="test_clean"
 # dev_clean dev_other"
 #test_sets="test_clean"
 
@@ -35,5 +35,5 @@ inference_config=conf/decode_asr.yaml
     --test_sets "${test_sets}" \
     --inference_asr_model "valid.cer_ctc.ave_10best.pth" \
     --lm_train_text "data/${train_set}/text" \
-    --inference_tag "hard" \
+    --inference_tag "hard_id2" \
     --bpe_train_text "data/${train_set}/text" "$@" 
