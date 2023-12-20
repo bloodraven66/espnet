@@ -135,7 +135,7 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
         self.tau = tau
         assert gs_mode in ["soft"], f'{gs_mode}'
         
-    def forward(self, x, change_expert=None, hard_gs_decoding=False):
+    def forward(self, x, change_expert=None, hard_gs_decoding=True):
         """Forward function."""
         bs, ts, dim = x.shape            
         probs = self.softmax(self.expert_predictor(torch.mean(x, 1)))
