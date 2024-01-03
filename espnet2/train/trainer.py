@@ -38,8 +38,16 @@ from espnet2.utils.kwargs2args import kwargs2args
 if torch.distributed.is_available():
     from torch.distributed import ReduceOp
 
+autocast_args = dict()
 if V(torch.__version__) >= V("1.6.0"):
     from torch.cuda.amp import GradScaler, autocast
+
+    if (
+        V(torch.__version__) >= V("1.10.0")
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+    ):
+        autocast_args = dict(dtype=torch.bfloat16)
 else:
     # Nothing to do if torch<1.6.0
     @contextmanager
@@ -52,6 +60,11 @@ try:
     import fairscale
 except ImportError:
     fairscale = None
+
+try:
+    import loralib as lora
+except Exception:
+    lora = None
 
 
 @dataclasses.dataclass
@@ -69,6 +82,8 @@ class TrainerOptions:
     use_matplotlib: bool
     use_tensorboard: bool
     use_wandb: bool
+    use_lora: bool
+    save_lora_only: bool
     output_dir: Union[Path, str]
     max_epoch: int
     seed: int
@@ -130,12 +145,13 @@ class Trainer:
         schedulers: Sequence[Optional[AbsScheduler]],
         scaler: Optional[GradScaler],
         ngpu: int = 0,
-    ):  
+        strict: bool = True,
+    ):
         states = torch.load(
             checkpoint,
             map_location=f"cuda:{torch.cuda.current_device()}" if ngpu > 0 else "cpu",
         )
-        model.load_state_dict(states["model"])
+        model.load_state_dict(states["model"], strict=strict)
         reporter.load_state_dict(states["reporter"])
         for optimizer, state in zip(optimizers, states["optimizers"]):
             optimizer.load_state_dict(state)
@@ -194,6 +210,11 @@ class Trainer:
         else:
             scaler = None
 
+        use_lora = getattr(trainer_options, "use_lora", False)
+        save_lora_only = getattr(trainer_options, "save_lora_only", False)
+        if use_lora and lora is None:
+            raise RuntimeError("Requiring loralib. Do 'pip install loralib'")
+
         if trainer_options.resume and (output_dir / "checkpoint.pth").exists():
             cls.resume(
                 checkpoint=output_dir / "checkpoint.pth",
@@ -203,6 +224,7 @@ class Trainer:
                 reporter=reporter,
                 scaler=scaler,
                 ngpu=trainer_options.ngpu,
+                strict=not use_lora,
             )
 
         start_epoch = reporter.get_epoch() + 1
@@ -337,13 +359,16 @@ class Trainer:
                     reporter.wandb_log()
 
                 # 4. Save/Update the checkpoint
-                import shutil
-                import os
-                if os.path.exists(output_dir / "checkpoint.pth"):
-                    shutil.copyfile(output_dir / "checkpoint.pth", output_dir / "checkpoint_prev.pth")
+                if use_lora and save_lora_only:
+                    # Only the LoRA realted params are saved, not the whole model
+                    model_state_dict = lora.lora_state_dict(model)
+                else:
+                    # Save all params of the model
+                    model_state_dict = model.state_dict()
+
                 torch.save(
                     {
-                        "model": model.state_dict(),
+                        "model": model_state_dict,
                         "reporter": reporter.state_dict(),
                         "optimizers": [o.state_dict() for o in optimizers],
                         "schedulers": [
@@ -356,7 +381,7 @@ class Trainer:
                 )
 
                 # 5. Save and log the model and update the link to the best model
-                torch.save(model.state_dict(), output_dir / f"{iepoch}epoch.pth")
+                torch.save(model_state_dict, output_dir / f"{iepoch}epoch.pth")
 
                 # Creates a sym link latest.pth -> {iepoch}epoch.pth
                 p = output_dir / "latest.pth"
@@ -555,7 +580,10 @@ class Trainer:
                         )
                 del _model
 
-            with autocast(scaler is not None):
+            with autocast(
+                scaler is not None,
+                **autocast_args,
+            ):
                 with reporter.measure_time("forward_time"):
                     retval = model(**batch)
 
@@ -671,6 +699,17 @@ class Trainer:
                             scaler.update()
 
                 else:
+                    reporter.register(
+                        {
+                            "grad_norm": grad_norm,
+                            "clip": torch.where(
+                                grad_norm > grad_clip,
+                                grad_norm.new_tensor(100),
+                                grad_norm.new_tensor(0),
+                            ),
+                            "loss_scale": scaler.get_scale() if scaler else 1.0,
+                        }
+                    )
                     all_steps_are_invalid = False
                     with reporter.measure_time("optim_step_time"):
                         for iopt, (optimizer, scheduler) in enumerate(
@@ -743,7 +782,7 @@ class Trainer:
         # [For distributed] Because iteration counts are not always equals between
         # processes, send stop-flag to the other processes if iterator is finished
         iterator_stop = torch.tensor(0).to("cuda" if ngpu > 0 else "cpu")
-        for (utt_id, batch) in iterator:
+        for utt_id, batch in iterator:
             assert isinstance(batch, dict), type(batch)
             if distributed:
                 torch.distributed.all_reduce(iterator_stop, ReduceOp.SUM)
@@ -818,7 +857,6 @@ class Trainer:
             for k, att_list in att_dict.items():
                 assert len(att_list) == len(ids), (len(att_list), len(ids))
                 for id_, att_w in zip(ids, att_list):
-
                     if isinstance(att_w, torch.Tensor):
                         att_w = att_w.detach().cpu().numpy()
 

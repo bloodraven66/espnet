@@ -91,6 +91,7 @@ class PITLossWrapper(AbsLossWrapper):
         )  # (batch_size, num_perm)
 
         min_losses, min_ids = torch.min(losses, dim=1)
+        min_ids = min_ids.cpu()  # because all_permutations is a cpu tensor.
         opt_perm = all_permutations[min_ids]  # (batch_size, num_ref)
 
         # Permute the inf and inf_lens according to the optimal perm
@@ -103,7 +104,6 @@ class PITLossWrapper(AbsLossWrapper):
         num_ref = None
 
         for arg in args:  # (batch, num_inf, ...)
-
             if batch_size is None:
                 batch_size, num_ref = arg.shape[:2]
             else:
@@ -131,7 +131,7 @@ class ESPnetASRModel(SingleESPnetASRModel):
         preencoder: Optional[AbsPreEncoder],
         encoder: AbsEncoder,
         postencoder: Optional[AbsPostEncoder],
-        decoder: AbsDecoder,
+        decoder: Optional[AbsDecoder],
         ctc: CTC,
         joint_network: Optional[torch.nn.Module],
         ctc_weight: float = 0.5,

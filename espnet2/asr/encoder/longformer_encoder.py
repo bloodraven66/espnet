@@ -25,6 +25,7 @@ from espnet.nets.pytorch_backend.transformer.positionwise_feed_forward import (
 from espnet.nets.pytorch_backend.transformer.repeat import repeat
 from espnet.nets.pytorch_backend.transformer.subsampling import (
     Conv2dSubsampling,
+    Conv2dSubsampling1,
     Conv2dSubsampling2,
     Conv2dSubsampling6,
     Conv2dSubsampling8,
@@ -158,6 +159,13 @@ class LongformerEncoder(ConformerEncoder):
                 dropout_rate,
                 pos_enc_class(output_size, positional_dropout_rate),
             )
+        elif input_layer == "conv2d1":
+            self.embed = Conv2dSubsampling1(
+                input_size,
+                output_size,
+                dropout_rate,
+                pos_enc_class(output_size, positional_dropout_rate),
+            )
         elif input_layer == "conv2d2":
             self.embed = Conv2dSubsampling2(
                 input_size,
@@ -286,6 +294,7 @@ class LongformerEncoder(ConformerEncoder):
         ilens: torch.Tensor,
         prev_states: torch.Tensor = None,
         ctc: CTC = None,
+        return_all_hs: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Calculate forward propagation.
 
@@ -293,6 +302,8 @@ class LongformerEncoder(ConformerEncoder):
             xs_pad (torch.Tensor): Input tensor (#batch, L, input_size).
             ilens (torch.Tensor): Input length (#batch).
             prev_states (torch.Tensor): Not to be used now.
+            ctc (CTC): ctc module for intermediate CTC loss
+            return_all_hs (bool): whether to return all hidden states
 
         Returns:
             torch.Tensor: Output tensor (#batch, L, output_size).
@@ -304,6 +315,7 @@ class LongformerEncoder(ConformerEncoder):
         masks = (~make_pad_mask(ilens)[:, None, :]).to(xs_pad.device)
         if (
             isinstance(self.embed, Conv2dSubsampling)
+            or isinstance(self.embed, Conv2dSubsampling1)
             or isinstance(self.embed, Conv2dSubsampling2)
             or isinstance(self.embed, Conv2dSubsampling6)
             or isinstance(self.embed, Conv2dSubsampling8)
@@ -333,10 +345,12 @@ class LongformerEncoder(ConformerEncoder):
             )
             masks = torch.nn.functional.pad(masks, (0, padding_len), "constant", False)
 
-        xs_pad, masks = self.encoders(xs_pad, masks)
         intermediate_outs = []
         if len(self.interctc_layer_idx) == 0:
-            xs_pad, masks = self.encoders(xs_pad, masks)
+            for layer_idx, encoder_layer in enumerate(self.encoders):
+                xs_pad, masks = encoder_layer(xs_pad, masks)
+                if return_all_hs:
+                    intermediate_outs.append(xs_pad)
         else:
             for layer_idx, encoder_layer in enumerate(self.encoders):
                 xs_pad, masks = encoder_layer(xs_pad, masks)

@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import torch.nn.functional as F
 from typeguard import check_argument_types
@@ -25,7 +27,9 @@ class CTC(torch.nn.Module):
         reduce: bool = True,
         ignore_nan_grad: bool = None,
         zero_infinity: bool = True,
-        num_decoders: int = 1,
+        brctc_risk_strategy: str = "exp",
+        brctc_group_strategy: str = "end",
+        brctc_risk_factor: float = 0.0,
     ):
         assert check_argument_types()
         super().__init__()
@@ -48,32 +52,97 @@ class CTC(torch.nn.Module):
             self.ctc_loss = torch.nn.CTCLoss(
                 reduction="none", zero_infinity=zero_infinity
             )
+        elif self.ctc_type == "builtin2":
+            self.ignore_nan_grad = True
+            logging.warning("builtin2")
+            self.ctc_loss = torch.nn.CTCLoss(reduction="none")
 
         elif self.ctc_type == "gtnctc":
             from espnet.nets.pytorch_backend.gtn_ctc import GTNCTCLossFunction
 
             self.ctc_loss = GTNCTCLossFunction.apply
+
+        elif self.ctc_type == "brctc":
+            try:
+                import k2
+            except ImportError:
+                raise ImportError("You should install K2 to use Bayes Risk CTC")
+
+            from espnet2.asr.bayes_risk_ctc import BayesRiskCTC
+
+            self.ctc_loss = BayesRiskCTC(
+                brctc_risk_strategy, brctc_group_strategy, brctc_risk_factor
+            )
+
         else:
             raise ValueError(f'ctc_type must be "builtin" or "gtnctc": {self.ctc_type}')
 
         self.reduce = reduce
 
     def loss_fn(self, th_pred, th_target, th_ilen, th_olen) -> torch.Tensor:
-        if self.ctc_type == "builtin":
-            if self.num_decoders == 1:
-                th_pred = th_pred.log_softmax(2)
-                loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
+        if self.ctc_type == "builtin" or self.ctc_type == "brctc":
+            th_pred = th_pred.log_softmax(2)
+            loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
+            if self.ctc_type == "builtin":
                 size = th_pred.size(1)
             else:
-                _th_pred = []
-                for idx in range(self.num_decoders):
-                    th_pred_ = th_pred[idx].softmax(2)
-                    _th_pred.append(th_pred_)
-                th_pred = torch.stack(_th_pred, -1) 
-                th_pred = torch.mean(th_pred, -1) 
-                th_pred = th_pred.log()
+                size = loss.size(0)  # some invalid examples will be excluded
+
+            if self.reduce:
+                # Batch-size average
+                loss = loss.sum() / size
+            else:
+                loss = loss / size
+            return loss
+
+        # builtin2 ignores nan losses using the logic below, while
+        # builtin relies on the zero_infinity flag in pytorch CTC
+        elif self.ctc_type == "builtin2":
+            th_pred = th_pred.log_softmax(2)
+            loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
+
+            if loss.requires_grad and self.ignore_nan_grad:
+                # ctc_grad: (L, B, O)
+                ctc_grad = loss.grad_fn(torch.ones_like(loss))
+                ctc_grad = ctc_grad.sum([0, 2])
+                indices = torch.isfinite(ctc_grad)
+                size = indices.long().sum()
+                if size == 0:
+                    # Return as is
+                    logging.warning(
+                        "All samples in this mini-batch got nan grad."
+                        " Returning nan value instead of CTC loss"
+                    )
+                elif size != th_pred.size(1):
+                    logging.warning(
+                        f"{th_pred.size(1) - size}/{th_pred.size(1)}"
+                        " samples got nan grad."
+                        " These were ignored for CTC loss."
+                    )
+
+                    # Create mask for target
+                    target_mask = torch.full(
+                        [th_target.size(0)],
+                        1,
+                        dtype=torch.bool,
+                        device=th_target.device,
+                    )
+                    s = 0
+                    for ind, le in enumerate(th_olen):
+                        if not indices[ind]:
+                            target_mask[s : s + le] = 0
+                        s += le
+
+                    # Calc loss again using maksed data
+                    loss = self.ctc_loss(
+                        th_pred[:, indices, :],
+                        th_target[target_mask],
+                        th_ilen[indices],
+                        th_olen[indices],
+                    )
+            else:
                 size = th_pred.size(1)
-                loss = self.ctc_loss(th_pred, th_target, th_ilen, th_olen)
+
             if self.reduce:
                 # Batch-size average
                 loss = loss.sum() / size
@@ -98,22 +167,15 @@ class CTC(torch.nn.Module):
             ys_lens: batch of lengths of character sequence (B)
         """
         # hs_pad: (B, L, NProj) -> ys_hat: (B, L, Nvocab)
-        
-        if self.num_decoders == 1:
-            ys_hat = self.ctc_lo(F.dropout(hs_pad, p=self.dropout_rate))
-            device = hs_pad.device
-            dtype = hs_pad.dtype
-        else:
-            ys_hat_ = []
-            for idx in range(len(self.ctc_lo)):
-                _ys_hat = self.ctc_lo[idx](F.dropout(hs_pad[idx], p=self.dropout_rate))
-                ys_hat_.append(_ys_hat)
-            device = _ys_hat.device
-            dtype = _ys_hat.dtype
-            ys_hat = ys_hat_
-            
-    
-        if self.ctc_type == "gtnctc":
+        ys_hat = self.ctc_lo(F.dropout(hs_pad, p=self.dropout_rate))
+
+        if self.ctc_type == "brctc":
+            loss = self.loss_fn(ys_hat, ys_pad, hlens, ys_lens).to(
+                device=hs_pad.device, dtype=hs_pad.dtype
+            )
+            return loss
+
+        elif self.ctc_type == "gtnctc":
             # gtn expects list form for ys
             ys_true = [y[y != -1] for y in ys_pad]  # parse padded ys
         else:

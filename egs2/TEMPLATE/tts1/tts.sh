@@ -67,8 +67,8 @@ f0max=400 # Minimum f0 for pitch extraction.
 
 # X-Vector related
 use_xvector=false   # Whether to use x-vector.
-xvector_tool=kaldi  # Toolkit for extracting x-vector (speechbrain, espnet, kaldi)
-xvector_model=speechbrain/spkrec-ecapa-voxceleb  # For only espnet or speechbrain
+xvector_tool=kaldi  # Toolkit for extracting x-vector (speechbrain, rawnet, espnet, kaldi)
+xvector_model=speechbrain/spkrec-ecapa-voxceleb  # For only espnet, speechbrain, or rawnet
 
 # Vocabulary related
 oov="<unk>"         # Out of vocabrary symbol.
@@ -210,7 +210,7 @@ EOF
 
 log "$0 $*"
 # Save command line args for logging (they will be lost after utils/parse_options.sh)
-run_args=$(pyscripts/utils/print_args.py $0 "$@")
+run_args=$(scripts/utils/print_args.sh $0 "$@")
 . utils/parse_options.sh
 
 if [ $# -ne 0 ]; then
@@ -405,6 +405,9 @@ if ! "${skip_data_prep}"; then
                         _suf="/org"
                     else
                         _suf=""
+                    fi
+                    if [ "${xvector_tool}" = "rawnet" ]; then
+                        xvector_model="RawNet"
                     fi
                     pyscripts/utils/extract_xvectors.py \
                         --pretrained_model ${xvector_model} \
@@ -672,6 +675,10 @@ if ! "${skip_train}"; then
         for i in $(seq "${_nj}"); do
             _opts+="--input_dir ${_logdir}/stats.${i} "
         done
+        if [ "${feats_normalize}" != global_mvn ]; then
+            # Skip summerizaing stats if not using global MVN
+            _opts+="--skip_sum_stats"
+        fi
         ${python} -m espnet2.bin.aggregate_stats_dirs ${_opts} --output_dir "${tts_stats_dir}"
 
         # Append the num-tokens at the last dimensions. This is used for batch-bins count
@@ -1006,7 +1013,7 @@ if ! "${skip_eval}"; then
             # shellcheck disable=SC2086
             utils/split_scp.pl "${key_file}" ${split_scps}
 
-            # 3. Submit decoding jobs
+            # 2. Submit decoding jobs
             log "Decoding started... log: '${_logdir}/tts_inference.*.log'"
             # shellcheck disable=SC2046,SC2086
             ${_cmd} --gpu "${_ngpu}" JOB=1:"${_nj}" "${_logdir}"/tts_inference.JOB.log \
@@ -1021,7 +1028,7 @@ if ! "${skip_eval}"; then
                     --vocoder_file "${vocoder_file}" \
                     ${_opts} ${_ex_opts} ${inference_args} || { cat $(grep -l -i error "${_logdir}"/tts_inference.*.log) ; exit 1; }
 
-            # 4. Concatenates the output files from each jobs
+            # 3. Concatenates the output files from each jobs
             if [ -e "${_logdir}/output.${_nj}/norm" ]; then
                 mkdir -p "${_dir}"/norm
                 for i in $(seq "${_nj}"); do

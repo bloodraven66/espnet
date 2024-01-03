@@ -13,7 +13,6 @@ is_torch_1_9_plus = V(torch.__version__) >= V("1.9.0")
 
 @pytest.mark.parametrize("inf_num, time_domain", [(4, True), (4, False)])
 def test_MixITSolver_forward(inf_num, time_domain):
-
     batch = 2
     if time_domain:
         solver = MixITSolver(TimeDomainL1())
@@ -43,7 +42,7 @@ def test_MixITSolver_forward(inf_num, time_domain):
         .transpose(1, 0)
         .float()
     )
-    assert perm[0].equal(torch.tensor(correct_perm1))
+    assert perm[0].equal(correct_perm1.clone().detach())
 
     correct_perm2 = (
         F.one_hot(
@@ -53,7 +52,7 @@ def test_MixITSolver_forward(inf_num, time_domain):
         .transpose(1, 0)
         .float()
     )
-    assert perm[1].equal(torch.tensor(correct_perm2))
+    assert perm[1].equal(correct_perm2.clone().detach())
 
 
 @pytest.mark.parametrize(
@@ -61,7 +60,6 @@ def test_MixITSolver_forward(inf_num, time_domain):
     [(4, True), (4, False)],
 )
 def test_MixITSolver_complex_forward(inf_num, torch_complex):
-
     batch = 2
     solver = MixITSolver(FrequencyDomainL1())
 
@@ -110,7 +108,7 @@ def test_MixITSolver_complex_forward(inf_num, torch_complex):
         .transpose(1, 0)
         .float()
     )
-    assert perm[0].equal(torch.tensor(correct_perm1))
+    assert perm[0].equal(correct_perm1.clone().detach())
 
     correct_perm2 = (
         F.one_hot(
@@ -120,4 +118,4 @@ def test_MixITSolver_complex_forward(inf_num, torch_complex):
         .transpose(1, 0)
         .float()
     )
-    assert perm[1].equal(torch.tensor(correct_perm2))
+    assert perm[1].equal(correct_perm2.clone().detach())

@@ -22,15 +22,23 @@ from typeguard import check_argument_types, check_return_type
 
 from espnet import __version__
 from espnet2.iterators.abs_iter_factory import AbsIterFactory
+from espnet2.iterators.category_iter_factory import CategoryIterFactory
 from espnet2.iterators.chunk_iter_factory import ChunkIterFactory
 from espnet2.iterators.multiple_iter_factory import MultipleIterFactory
 from espnet2.iterators.sequence_iter_factory import SequenceIterFactory
+from espnet2.layers.create_lora_adapter import create_lora_adapter
 from espnet2.main_funcs.collect_stats import collect_stats
+from espnet2.optimizers.optim_groups import configure_optimizer
 from espnet2.optimizers.sgd import SGD
 from espnet2.samplers.build_batch_sampler import BATCH_TYPES, build_batch_sampler
+from espnet2.samplers.category_balanced_sampler import CategoryBalancedSampler
 from espnet2.samplers.unsorted_batch_sampler import UnsortedBatchSampler
+from espnet2.schedulers.cosine_anneal_warmup_restart import (
+    CosineAnnealingWarmupRestarts,
+)
 from espnet2.schedulers.noam_lr import NoamLR
 from espnet2.schedulers.warmup_lr import WarmupLR
+from espnet2.schedulers.warmup_reducelronplateau import WarmupReduceLROnPlateau
 from espnet2.schedulers.warmup_step_lr import WarmupStepLR
 from espnet2.torch_utils.load_pretrained_model import load_pretrained_model
 from espnet2.torch_utils.model_summary import model_summary
@@ -143,11 +151,13 @@ scheduler_classes = dict(
     exponentiallr=torch.optim.lr_scheduler.ExponentialLR,
     CosineAnnealingLR=torch.optim.lr_scheduler.CosineAnnealingLR,
     noamlr=NoamLR,
-    warmupsteplr=WarmupStepLR,
     warmuplr=WarmupLR,
+    warmupsteplr=WarmupStepLR,
+    warmupReducelronplateau=WarmupReduceLROnPlateau,
     cycliclr=torch.optim.lr_scheduler.CyclicLR,
     onecyclelr=torch.optim.lr_scheduler.OneCycleLR,
     CosineAnnealingWarmRestarts=torch.optim.lr_scheduler.CosineAnnealingWarmRestarts,
+    CosineAnnealingWarmupRestarts=CosineAnnealingWarmupRestarts,
 )
 # To lower keys
 optim_classes = {k.lower(): v for k, v in optim_classes.items()}
@@ -165,6 +175,7 @@ class IteratorOptions:
     batch_type: str
     max_cache_size: float
     max_cache_fd: int
+    allow_multi_rates: bool
     distributed: bool
     num_batches: Optional[int]
     num_iters_per_epoch: Optional[int]
@@ -293,6 +304,12 @@ class AbsTask(ABC):
             help="The verbose level of logging",
         )
         group.add_argument(
+            "--drop_last_iter",
+            type=str2bool,
+            default=False,
+            help="Exclude the minibatch with leftovers.",
+        )
+        group.add_argument(
             "--dry_run",
             type=str2bool,
             default=False,
@@ -301,8 +318,15 @@ class AbsTask(ABC):
         group.add_argument(
             "--iterator_type",
             type=str,
-            choices=["sequence", "chunk", "task", "none"],
+            choices=["sequence", "category", "chunk", "task", "none"],
             default="sequence",
+            help="Specify iterator type",
+        )
+        group.add_argument(
+            "--valid_iterator_type",
+            type=str,
+            choices=["sequence", "category", "chunk", "task", "none"],
+            default=None,
             help="Specify iterator type",
         )
 
@@ -619,6 +643,25 @@ class AbsTask(ABC):
             default=False,
             help="Set torch.autograd.set_detect_anomaly",
         )
+        group.add_argument(
+            "--use_lora",
+            type=str2bool,
+            default=False,
+            help="Enable LoRA based finetuning, see (https://arxiv.org/abs/2106.09685) "
+            "for large pre-trained foundation models, like Whisper",
+        )
+        group.add_argument(
+            "--save_lora_only",
+            type=str2bool,
+            default=True,
+            help="Only save LoRA parameters or save all model parameters",
+        )
+        group.add_argument(
+            "--lora_conf",
+            action=NestedDictAction,
+            default=dict(),
+            help="Configuration for LoRA based finetuning",
+        )
 
         group = parser.add_argument_group("Pretraining model related")
         group.add_argument("--pretrain_path", help="This option is obsoleted")
@@ -668,7 +711,7 @@ class AbsTask(ABC):
             type=int,
             default=20,
             help="The mini-batch size used for training. Used if batch_type='unsorted',"
-            " 'sorted', or 'folded'.",
+            " 'sorted', or 'folded', or 'catbel'.",
         )
         group.add_argument(
             "--valid_batch_size",
@@ -720,6 +763,13 @@ class AbsTask(ABC):
             'lengths. To enable this, "shape_file" must have the length information.',
         )
         group.add_argument(
+            "--shuffle_within_batch",
+            type=str2bool,
+            default=False,
+            help="Shuffles wholes batches in sample-wise. Required for"
+            "Classification tasks normally.",
+        )
+        group.add_argument(
             "--sort_batch",
             type=str,
             default="descending",
@@ -759,6 +809,25 @@ class AbsTask(ABC):
             default=1024,
             help="Shuffle in the specified number of chunks and generate mini-batches "
             "More larger this value, more randomness can be obtained.",
+        )
+        group.add_argument(
+            "--chunk_excluded_key_prefixes",
+            type=str,
+            nargs="+",
+            default=[],
+            help="List of key prefixes. Keys that satisfy either condition below "
+            "will be excluded from the length consistency check in ChunkIterFactory:\n"
+            "  - exactly match one of the prefixes in `chunk_excluded_key_prefixes`\n"
+            "  - have one of the prefixes in `chunk_excluded_key_prefixes` and "
+            "end with numbers",
+        )
+        group.add_argument(
+            "--chunk_default_fs",
+            type=int_or_none,
+            default=None,
+            help="Default sampling rate used for the chunk length. Will be used to "
+            "adaptively adjust the chunk length for data of different sampling rates. "
+            "(If None, the chunk length will be fixed.)",
         )
 
         group = parser.add_argument_group("Dataset related")
@@ -809,6 +878,12 @@ class AbsTask(ABC):
             "This feature is only valid when data type is 'kaldi_ark'.",
         )
         group.add_argument(
+            "--allow_multi_rates",
+            type=str2bool,
+            default=False,
+            help="Whether to allow audios to have different sampling rates",
+        )
+        group.add_argument(
             "--valid_max_cache_size",
             type=humanfriendly_parse_size_or_none,
             default=None,
@@ -817,6 +892,21 @@ class AbsTask(ABC):
         )
 
         group = parser.add_argument_group("Optimizer related")
+        group.add_argument(
+            "--exclude_weight_decay",
+            type=str2bool,
+            default=False,
+            help="Exclude weight decay in optimizer for model bias, normalization, "
+            "or other special parameters",
+        )
+        group.add_argument(
+            "--exclude_weight_decay_conf",
+            action=NestedDictAction,
+            default=dict(),
+            help="The keyword arguments for configuring weight decay in optimizer. "
+            "e.g., 'bias_weight_decay': False will set zero weight decay for bias "
+            "params. See also espnet2.optimizers.optim_groups.configure_optimizer.",
+        )
         for i in range(1, cls.num_optimizers + 1):
             suf = "" if i == 1 else str(i)
             group.add_argument(
@@ -873,7 +963,15 @@ class AbsTask(ABC):
                 params=model.parameters(), optim=optim_class, **args.optim_conf
             )
         else:
-            optim = optim_class(model.parameters(), **args.optim_conf)
+            if args.exclude_weight_decay:
+                optim = configure_optimizer(
+                    model,
+                    optim_class,
+                    args.optim_conf,
+                    args.exclude_weight_decay_conf,
+                )
+            else:
+                optim = optim_class(model.parameters(), **args.optim_conf)
 
         optimizers = [optim]
         return optimizers
@@ -1117,49 +1215,62 @@ class AbsTask(ABC):
             logging.info("Invoking torch.autograd.set_detect_anomaly(True)")
             torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-        # 2. Build model
-        model = cls.build_model(args=args)
-        if not isinstance(model, AbsESPnetModel):
-            raise RuntimeError(
-                f"model must inherit {AbsESPnetModel.__name__}, but got {type(model)}"
+        if (
+            args.collect_stats
+            and getattr(args, "model_conf", None) is not None
+            and not args.model_conf.get("extract_feats_in_collect_stats", True)
+        ):
+            model = None
+            logging.info("Skipping model building in collect_stats stage.")
+        else:
+            # 2. Build model
+            model = cls.build_model(args=args)
+            if not isinstance(model, AbsESPnetModel):
+                raise RuntimeError(
+                    f"model must inherit {AbsESPnetModel.__name__},"
+                    f" but got {type(model)}"
+                )
+            model = model.to(
+                dtype=getattr(torch, args.train_dtype),
+                device="cuda" if args.ngpu > 0 else "cpu",
             )
-        model = model.to(
-            dtype=getattr(torch, args.train_dtype),
-            device="cuda" if args.ngpu > 0 else "cpu",
-        )
-        for t in args.freeze_param:
-            for k, p in model.named_parameters():
-                if k.startswith(t + ".") or k == t:
-                    logging.info(f"Setting {k}.requires_grad = False")
-                    p.requires_grad = False
+            for t in args.freeze_param:
+                for k, p in model.named_parameters():
+                    if k.startswith(t + ".") or k == t:
+                        logging.info(f"Setting {k}.requires_grad = False")
+                        p.requires_grad = False
 
-        # 3. Build optimizer
-        optimizers = cls.build_optimizers(args, model=model)
+            # Use LoRA to finetune the large pre-trained foundation models, like Whisper
+            if getattr(args, "use_lora", False):
+                create_lora_adapter(model, **args.lora_conf)
 
-        # 4. Build schedulers
-        schedulers = []
-        for i, optim in enumerate(optimizers, 1):
-            suf = "" if i == 1 else str(i)
-            name = getattr(args, f"scheduler{suf}")
-            conf = getattr(args, f"scheduler{suf}_conf")
-            if name is not None:
-                cls_ = scheduler_classes.get(name)
-                if cls_ is None:
-                    raise ValueError(
-                        f"must be one of {list(scheduler_classes)}: {name}"
-                    )
-                scheduler = cls_(optim, **conf)
-            else:
-                scheduler = None
+            # 3. Build optimizer
+            optimizers = cls.build_optimizers(args, model=model)
 
-            schedulers.append(scheduler)
+            # 4. Build schedulers
+            schedulers = []
+            for i, optim in enumerate(optimizers, 1):
+                suf = "" if i == 1 else str(i)
+                name = getattr(args, f"scheduler{suf}")
+                conf = getattr(args, f"scheduler{suf}_conf")
+                if name is not None:
+                    cls_ = scheduler_classes.get(name)
+                    if cls_ is None:
+                        raise ValueError(
+                            f"must be one of {list(scheduler_classes)}: {name}"
+                        )
+                    scheduler = cls_(optim, **conf)
+                else:
+                    scheduler = None
 
-        logging.info(pytorch_cudnn_version())
-        logging.info(model_summary(model))
-        for i, (o, s) in enumerate(zip(optimizers, schedulers), 1):
-            suf = "" if i == 1 else str(i)
-            logging.info(f"Optimizer{suf}:\n{o}")
-            logging.info(f"Scheduler{suf}: {s}")
+                schedulers.append(scheduler)
+
+            logging.info(pytorch_cudnn_version())
+            logging.info(model_summary(model))
+            for i, (o, s) in enumerate(zip(optimizers, schedulers), 1):
+                suf = "" if i == 1 else str(i)
+                logging.info(f"Optimizer{suf}:\n{o}")
+                logging.info(f"Scheduler{suf}: {s}")
 
         # 5. Dump "args" to config.yaml
         # NOTE(kamo): "args" should be saved after object-buildings are done
@@ -1192,6 +1303,10 @@ class AbsTask(ABC):
                 valid_key_file = args.valid_shape_file[0]
             else:
                 valid_key_file = None
+
+            if model and not getattr(model, "extract_feats_in_collect_stats", True):
+                model = None
+                logging.info("Skipping collect_feats in collect_stats stage.")
 
             collect_stats(
                 model=model,
@@ -1343,6 +1458,7 @@ class AbsTask(ABC):
             batch_type = args.batch_type
             max_cache_size = args.max_cache_size
             max_cache_fd = args.max_cache_fd
+            allow_multi_rates = args.allow_multi_rates
             distributed = distributed_option.distributed
             num_batches = None
             num_iters_per_epoch = args.num_iters_per_epoch
@@ -1372,6 +1488,7 @@ class AbsTask(ABC):
             else:
                 max_cache_size = args.valid_max_cache_size
             max_cache_fd = args.max_cache_fd
+            allow_multi_rates = args.allow_multi_rates
             distributed = distributed_option.distributed
             num_batches = None
             num_iters_per_epoch = None
@@ -1387,6 +1504,7 @@ class AbsTask(ABC):
             batch_bins = 0
             num_batches = args.num_att_plot
             max_cache_fd = args.max_cache_fd
+            allow_multi_rates = args.allow_multi_rates
             # num_att_plot should be a few sample ~ 3, so cache all data.
             max_cache_size = np.inf if args.max_cache_size != 0.0 else 0.0
             # always False because plot_attention performs on RANK0
@@ -1407,6 +1525,7 @@ class AbsTask(ABC):
             num_batches=num_batches,
             max_cache_size=max_cache_size,
             max_cache_fd=max_cache_fd,
+            allow_multi_rates=allow_multi_rates,
             distributed=distributed,
             num_iters_per_epoch=num_iters_per_epoch,
             train=train,
@@ -1441,7 +1560,7 @@ class AbsTask(ABC):
         e.g. If The number of mini-batches equals to 4, the following two are same:
 
         - 1 epoch without "--num_iters_per_epoch"
-        - 4 epoch with "--num_iters_per_epoch" == 4
+        - 4 epoch with "--num_iters_per_epoch" == 1
 
         """
         assert check_argument_types()
@@ -1452,26 +1571,37 @@ class AbsTask(ABC):
             for k, v in kwargs.items():
                 setattr(iter_options, k, v)
 
-        if args.iterator_type == "sequence":
+        if mode == "valid" and args.valid_iterator_type is not None:
+            iterator_type = args.valid_iterator_type
+        else:
+            iterator_type = args.iterator_type
+
+        if iterator_type == "sequence":
             return cls.build_sequence_iter_factory(
                 args=args,
                 iter_options=iter_options,
                 mode=mode,
             )
-        elif args.iterator_type == "chunk":
+        elif iterator_type == "category":
+            return cls.build_category_iter_factory(
+                args=args,
+                iter_options=iter_options,
+                mode=mode,
+            )
+        elif iterator_type == "chunk":
             return cls.build_chunk_iter_factory(
                 args=args,
                 iter_options=iter_options,
                 mode=mode,
             )
-        elif args.iterator_type == "task":
+        elif iterator_type == "task":
             return cls.build_task_iter_factory(
                 args=args,
                 iter_options=iter_options,
                 mode=mode,
             )
         else:
-            raise RuntimeError(f"Not supported: iterator_type={args.iterator_type}")
+            raise RuntimeError(f"Not supported: iterator_type={iterator_type}")
 
     @classmethod
     def build_sequence_iter_factory(
@@ -1485,6 +1615,7 @@ class AbsTask(ABC):
             preprocess=iter_options.preprocess_fn,
             max_cache_size=iter_options.max_cache_size,
             max_cache_fd=iter_options.max_cache_fd,
+            allow_multi_rates=iter_options.allow_multi_rates,
         )
         cls.check_task_requirements(
             dataset, args.allow_variable_data_keys, train=iter_options.train
@@ -1502,6 +1633,7 @@ class AbsTask(ABC):
             logging.warning("Reading " + utt2category_file)
         else:
             utt2category_file = None
+
         batch_sampler = build_batch_sampler(
             type=iter_options.batch_type,
             shape_files=iter_options.shape_files,
@@ -1510,7 +1642,7 @@ class AbsTask(ABC):
             batch_bins=iter_options.batch_bins,
             sort_in_batch=args.sort_in_batch,
             sort_batch=args.sort_batch,
-            drop_last=False,
+            drop_last=args.drop_last_iter,
             min_batch_size=torch.distributed.get_world_size()
             if iter_options.distributed
             else 1,
@@ -1547,6 +1679,91 @@ class AbsTask(ABC):
             seed=args.seed,
             num_iters_per_epoch=iter_options.num_iters_per_epoch,
             shuffle=iter_options.train,
+            shuffle_within_batch=args.shuffle_within_batch,
+            num_workers=args.num_workers,
+            collate_fn=iter_options.collate_fn,
+            pin_memory=args.ngpu > 0,
+        )
+
+    @classmethod
+    def build_category_iter_factory(
+        cls, args: argparse.Namespace, iter_options: IteratorOptions, mode: str
+    ) -> AbsIterFactory:
+        assert check_argument_types()
+
+        dataset = ESPnetDataset(
+            iter_options.data_path_and_name_and_type,
+            float_dtype=args.train_dtype,
+            preprocess=iter_options.preprocess_fn,
+            max_cache_size=iter_options.max_cache_size,
+            max_cache_fd=iter_options.max_cache_fd,
+            allow_multi_rates=iter_options.allow_multi_rates,
+        )
+        cls.check_task_requirements(
+            dataset, args.allow_variable_data_keys, train=iter_options.train
+        )
+
+        if Path(
+            Path(iter_options.data_path_and_name_and_type[0][0]).parent, "category2utt"
+        ).exists():
+            category2utt_file = str(
+                Path(
+                    Path(iter_options.data_path_and_name_and_type[0][0]).parent,
+                    "category2utt",
+                )
+            )
+            logging.warning("Reading " + category2utt_file)
+        else:
+            category2utt_file = None
+            raise ValueError(
+                "category2utt mandatory for category iterator, but not found"
+            )
+
+        sampler_args = dict(
+            batch_size=iter_options.batch_size,
+            min_batch_size=torch.distributed.get_world_size()
+            if iter_options.distributed
+            else 1,
+            drop_last=args.drop_last_iter,
+            category2utt_file=category2utt_file,
+            epoch=1,
+            num_batches=iter_options.num_batches,
+            distributed=iter_options.distributed,
+        )
+        batch_sampler = CategoryBalancedSampler(**sampler_args)
+
+        batches = list(batch_sampler)
+
+        if iter_options.num_batches is not None:
+            batches = batches[: iter_options.num_batches]
+
+        bs_list = [len(batch) for batch in batches]
+
+        logging.info(f"[{mode}] dataset:\n{dataset}")
+        logging.info(f"[{mode}] Batch sampler: {batch_sampler}")
+        logging.info(
+            f"[{mode}] mini-batch sizes summary: N-batch={len(bs_list)}, "
+            f"mean={np.mean(bs_list):.1f}, min={np.min(bs_list)}, max={np.max(bs_list)}"
+        )
+
+        if iter_options.distributed:
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            for batch in batches:
+                if len(batch) < world_size:
+                    raise RuntimeError(
+                        f"The batch-size must be equal or more than world_size: "
+                        f"{len(batch)} < {world_size}"
+                    )
+            batches = [batch[rank::world_size] for batch in batches]
+
+        return CategoryIterFactory(
+            dataset=dataset,
+            batches=batches,
+            seed=args.seed,
+            num_iters_per_epoch=iter_options.num_iters_per_epoch,
+            sampler_args=sampler_args,
+            shuffle=iter_options.train,
             num_workers=args.num_workers,
             collate_fn=iter_options.collate_fn,
             pin_memory=args.ngpu > 0,
@@ -1567,6 +1784,7 @@ class AbsTask(ABC):
             preprocess=iter_options.preprocess_fn,
             max_cache_size=iter_options.max_cache_size,
             max_cache_fd=iter_options.max_cache_fd,
+            allow_multi_rates=iter_options.allow_multi_rates,
         )
         cls.check_task_requirements(
             dataset, args.allow_variable_data_keys, train=iter_options.train
@@ -1622,6 +1840,8 @@ class AbsTask(ABC):
             chunk_length=args.chunk_length,
             chunk_shift_ratio=args.chunk_shift_ratio,
             num_cache_chunks=num_cache_chunks,
+            excluded_key_prefixes=args.chunk_excluded_key_prefixes,
+            default_fs=args.chunk_default_fs,
         )
 
     # NOTE(kamo): Not abstract class
@@ -1816,6 +2036,7 @@ class AbsTask(ABC):
         else:
             config_file = Path(config_file)
 
+        logging.info("config file: {}".format(config_file))
         with config_file.open("r", encoding="utf-8") as f:
             args = yaml.safe_load(f)
         args = argparse.Namespace(**args)
@@ -1825,11 +2046,44 @@ class AbsTask(ABC):
                 f"model must inherit {AbsESPnetModel.__name__}, but got {type(model)}"
             )
         model.to(device)
+
+        # For LoRA finetuned model, create LoRA adapter
+        use_lora = getattr(args, "use_lora", False)
+        if use_lora:
+            create_lora_adapter(model, **args.lora_conf)
+
         if model_file is not None:
             if device == "cuda":
                 # NOTE(kamo): "cuda" for torch.load always indicates cuda:0
                 #   in PyTorch<=1.4
                 device = f"cuda:{torch.cuda.current_device()}"
-            model.load_state_dict(torch.load(model_file, map_location=device))
+            try:
+                model.load_state_dict(
+                    torch.load(model_file, map_location=device),
+                    strict=not use_lora,
+                )
+            except RuntimeError:
+                # Note(simpleoier): the following part is to be compatible with
+                #   pretrained model using earlier versions before `0a625088`
+                state_dict = torch.load(model_file, map_location=device)
+                if any(["frontend.upstream.model" in k for k in state_dict.keys()]):
+                    if any(
+                        [
+                            "frontend.upstream.upstream.model" in k
+                            for k in dict(model.named_parameters())
+                        ]
+                    ):
+                        state_dict = {
+                            k.replace(
+                                "frontend.upstream.model",
+                                "frontend.upstream.upstream.model",
+                            ): v
+                            for k, v in state_dict.items()
+                        }
+                        model.load_state_dict(state_dict, strict=not use_lora)
+                    else:
+                        raise
+                else:
+                    raise
 
         return model, args
