@@ -30,6 +30,7 @@ class CTC(torch.nn.Module):
         brctc_risk_strategy: str = "exp",
         brctc_group_strategy: str = "end",
         brctc_risk_factor: float = 0.0,
+        num_decoders: int = 1,
     ):
         assert check_argument_types()
         super().__init__()
@@ -192,7 +193,7 @@ class CTC(torch.nn.Module):
             ys_true = torch.cat([ys_pad[i, :l] for i, l in enumerate(ys_lens)])
 
         loss = self.loss_fn(ys_hat, ys_true, hlens, ys_lens).to(
-            device=device, dtype=dtype
+            device=ys_hat.device, dtype=ys_hat.dtype
         )
 
         return loss

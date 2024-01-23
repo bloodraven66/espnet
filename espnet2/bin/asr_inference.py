@@ -114,6 +114,7 @@ class Speech2Text:
         lang_prompt_token: Optional[str] = None,
         nlp_prompt_token: Optional[str] = None,
         prompt_token_file: Optional[str] = None,
+        dialectid: Optional[str] = None,
     ):
         assert check_argument_types()
 
@@ -464,13 +465,14 @@ class Speech2Text:
 
     @torch.no_grad()
     def __call__(
-        self, speech: Union[torch.Tensor, np.ndarray]
+        self, speech: Union[torch.Tensor, np.ndarray], dialectid=None,
     ) -> Union[
         ListOfHypothesis,
         Tuple[
             ListOfHypothesis,
             Optional[Dict[int, List[str]]],
         ],
+        
     ]:
         """Inference
 
@@ -492,6 +494,8 @@ class Speech2Text:
         lengths = speech.new_full([1], dtype=torch.long, fill_value=speech.size(1))
         batch = {"speech": speech, "speech_lengths": lengths}
         logging.info("speech length: " + str(speech.size(1)))
+        if dialectid is not None:
+            batch["dialectid"] = dialectid
 
         # a. To device
         batch = to_device(batch, device=self.device)
@@ -613,7 +617,7 @@ class Speech2Text:
                         if hasattr(module, "setup_step"):
                             module.setup_step()
             nbest_hyps = self.beam_search(
-                x=enc, maxlenratio=self.maxlenratio, minlenratio=self.minlenratio, multiple_enc_outputs=multiple_enc_outputs
+                x=enc, maxlenratio=self.maxlenratio, minlenratio=self.minlenratio
             )
 
         nbest_hyps = nbest_hyps[: self.nbest]
@@ -718,6 +722,7 @@ def inference(
     lang_prompt_token: Optional[str],
     nlp_prompt_token: Optional[str],
     prompt_token_file: Optional[str],
+    dialectid: Optional[str]
 ):
     assert check_argument_types()
     if batch_size > 1:
@@ -774,6 +779,7 @@ def inference(
         prompt_token_file=prompt_token_file,
         lang_prompt_token=lang_prompt_token,
         nlp_prompt_token=nlp_prompt_token,
+        dialectid=dialectid,
     )
     speech2text = Speech2Text.from_pretrained(
         model_tag=model_tag,
@@ -1088,6 +1094,12 @@ def get_parser():
         type=str,
         default=None,
         help="Prompt token file",
+    )
+    group.add_argument(
+        "--dialectid",
+        type=str,
+        default=None,
+        help="dialectid file",
     )
     group.add_argument(
         "--normalize_length",

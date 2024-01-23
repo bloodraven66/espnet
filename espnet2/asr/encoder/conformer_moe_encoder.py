@@ -113,7 +113,22 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
 
     """
 
-    def __init__(self, idim, hidden_units, num_experts, capacity_factor, dropout_rate, activation=torch.nn.ReLU(), gs=False, gs_mode=None, tau=None, split_dims=False):
+    def __init__(
+                self, 
+                idim, 
+                hidden_units, 
+                num_experts, 
+                capacity_factor, 
+                dropout_rate, 
+                activation=torch.nn.ReLU(), 
+                gs=False, 
+                gs_mode=None, 
+                tau=None, 
+                split_dims=False,
+                use_expert_predictor=True,
+                global_expert=False,
+                global_expert_dim=512
+                ):
         """Construct an PositionwiseFeedForward object."""
         super(PositionwiseFeedForwardUttMoE, self).__init__()
 
@@ -123,22 +138,38 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
                 idim,
                 hidden_units // num_experts if split_dims else hidden_units[lnum],
                 dropout_rate,
-                activation
+                activation,
+                idim // 2 if global_expert is not False else idim,
             ),
         )
-        self.expert_predictor = torch.nn.Linear(idim, num_experts)
+        if use_expert_predictor:
+            self.expert_predictor = torch.nn.Linear(idim, num_experts)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.num_experts = num_experts
         self.capacity_factor = capacity_factor
         self.gs = gs
         self.gs_mode = gs_mode
         self.tau = tau
-        assert gs_mode in ["soft"], f'{gs_mode}'
+        if gs:
+            assert gs_mode in ["soft"], f'{gs_mode}'
+        self.global_expert = None
+        if global_expert:
+            self.global_expert = PositionwiseFeedForward(
+                idim,
+                global_expert_dim,
+                dropout_rate,
+                activation,
+                idim // 2,
+            )
         
-    def forward(self, x, change_expert=None, hard_gs_decoding=False):
+    def forward(self, x, change_expert=None, hard_gs_decoding=False, custom_expert_chosen=None):
         """Forward function."""
-        bs, ts, dim = x.shape            
-        probs = self.softmax(self.expert_predictor(torch.mean(x, 1)))
+        bs, ts, dim = x.shape      
+        if custom_expert_chosen is None:      
+            probs = self.softmax(self.expert_predictor(torch.mean(x, 1)))
+        else:
+            probs = torch.full((bs, 1), fill_value=1.0, device=x.device)
+            
         if self.gs:
             probs, expert_chosen = gumbel_softmax(probs, mode=self.gs_mode, tau=self.tau)
             if hard_gs_decoding:
@@ -164,21 +195,34 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
                     # final_output = torch.stack(all_expert_outputs, -1).mean(-1)
                     final_output = torch.stack(all_expert_outputs, -1).sum(-1)
         else:
-            expert_probs, expert_chosen = torch.topk(probs, 1, -1)
+            if custom_expert_chosen is None:
+                expert_probs, expert_chosen = torch.topk(probs, 1, -1)
+                
+            else:
+                expert_chosen = custom_expert_chosen
             
             if change_expert is not None:
                 expert_chosen = torch.full(expert_chosen.shape, fill_value=change_expert, device=expert_chosen.device, dtype=expert_chosen.dtype)
-            final_output = x.new_zeros(x.shape)
+            
+            if self.global_expert:
+                final_output = x.new_zeros(x.shape[0], x.shape[1], x.shape[2] // 2)
+            else:
+                final_output = x.new_zeros(x.shape)
             expert_indexes_list = []    
             for expert_idx in range(self.num_experts):
                 indices = torch.eq(expert_chosen, expert_idx).nonzero(as_tuple=True)[0]
                 if len(indices) > 0:
                     outputs = self.experts[expert_idx](x[indices, :])
                     final_output[indices, :] = outputs
-            final_output = final_output * (expert_probs / expert_probs.detach()).view(-1, 1, 1)
             
-        # final_output = final_output.view(bs, ts, dim)
-        # print(probs)
+            if custom_expert_chosen is None:
+                final_output = final_output * (expert_probs / expert_probs.detach()).view(-1, 1, 1)
+            
+        if self.global_expert:
+            global_expert_vals = self.global_expert(x)
+            final_output = torch.cat([global_expert_vals, final_output], -1)
+            
+
         return final_output, probs.view(bs, -1), expert_chosen.view(bs, -1)
     
     def bs_decoder(self, x, local_bw, expert_history, expert_idx_history, residual):
@@ -289,7 +333,7 @@ class ConformerMoEEncoderLayer(torch.nn.Module):
             self.concat_linear = nn.Linear(size + size, size)
         self.stochastic_depth_rate = stochastic_depth_rate
 
-    def forward(self, x_input, mask, cache=None):
+    def forward(self, x_input, mask, dialectid=None, cache=None):
         """Compute encoded features.
 
         Args:
@@ -381,7 +425,9 @@ class ConformerMoEEncoderLayer(torch.nn.Module):
         if self.normalize_before:
             x = self.norm_ff(x)
         if self.moe:
-            x, expert_probs, expert_chosen = self.feed_forward(x) 
+            if dialectid is not None:
+                dialectid = dialectid.squeeze() - 1
+            x, expert_probs, expert_chosen = self.feed_forward(x, custom_expert_chosen=dialectid) 
         else:
             x = self.feed_forward(x) 
             expert_probs, expert_chosen = [], []
@@ -540,6 +586,11 @@ class ConformerEncoderMoe(AbsEncoder):
         gs: bool = False,
         gs_mode: str = None,
         tau: float = None,
+        use_dialect_id: bool = False,
+        use_expert_predictor: bool = True,
+        global_expert: bool = False,
+        global_expert_dim: int = 512
+        
     ):
         assert check_argument_types()
         super().__init__()
@@ -648,6 +699,26 @@ class ConformerEncoderMoe(AbsEncoder):
                 dropout_rate,
                 activation,
             )
+        elif positionwise_layer_type == "guided_utt_moe":
+            self.moe = True
+            self.num_experts = num_experts
+            positionwise_layer = PositionwiseFeedForwardUttMoE
+            positionwise_layer_args = (
+                output_size,
+                linear_units,
+                num_experts,
+                capacity_factor,
+                dropout_rate,
+                activation,
+                False,
+                gs_mode,
+                tau,
+                False,
+                use_expert_predictor,
+                global_expert,
+                global_expert_dim,
+                
+            )
         elif positionwise_layer_type == "utt_moe":
             self.moe = True
             self.num_experts = num_experts
@@ -663,7 +734,8 @@ class ConformerEncoderMoe(AbsEncoder):
                 gs,
                 gs_mode,
                 tau,
-                True
+                True,
+                use_expert_predictor
             )
         elif positionwise_layer_type == "utt_mix_moe":
             self.moe = True
@@ -679,7 +751,8 @@ class ConformerEncoderMoe(AbsEncoder):
                 gs,
                 gs_mode,
                 tau,
-                False
+                False,
+                use_expert_predictor
                 )
         else:
             raise NotImplementedError("Support only linear or moe.")
@@ -830,6 +903,7 @@ class ConformerEncoderMoe(AbsEncoder):
         ilens: torch.Tensor,
         prev_states: torch.Tensor = None,
         ctc: CTC = None,
+        dialectid=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Calculate forward propagation.
 
@@ -869,42 +943,13 @@ class ConformerEncoderMoe(AbsEncoder):
         all_macaron_expert_chosen = []
         all_expert_probs = []
         all_expert_chosen = []
-        if len(self.interctc_layer_idx) == 0:
             # xs_pad, masks = self.encoders(xs_pad, masks)
-            for layer_idx, encoder_layer in enumerate(self.encoders):
-                xs_pad, masks, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen) = encoder_layer(xs_pad, masks)
-                all_macaron_expert_probs.append(macaron_expert_probs)
-                all_macaron_expert_chosen.append(macaron_expert_chosen)
-                all_expert_probs.append(expert_probs)
-                all_expert_chosen.append(expert_chosen)
-        else:
-            for layer_idx, encoder_layer in enumerate(self.encoders):
-                xs_pad, masks, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen) = encoder_layer(xs_pad, masks)
-                all_macaron_expert_probs.append(macaron_expert_probs)
-                all_macaron_expert_chosen.append(macaron_expert_chosen)
-                all_expert_probs.append(expert_probs)
-                all_expert_chosen.append(expert_chosen)
-                
-                if layer_idx + 1 in self.interctc_layer_idx:
-                    encoder_out = xs_pad
-                    if isinstance(encoder_out, tuple):
-                        encoder_out = encoder_out[0]
-
-                    # intermediate outputs are also normalized
-                    if self.normalize_before:
-                        encoder_out = self.after_norm(encoder_out)
-
-                    intermediate_outs.append((layer_idx + 1, encoder_out))
-
-                    if self.interctc_use_conditioning:
-                        ctc_out = ctc.softmax(encoder_out)
-
-                        if isinstance(xs_pad, tuple):
-                            x, pos_emb = xs_pad
-                            x = x + self.conditioning_layer(ctc_out)
-                            xs_pad = (x, pos_emb)
-                        else:
-                            xs_pad = xs_pad + self.conditioning_layer(ctc_out)
+        for layer_idx, encoder_layer in enumerate(self.encoders):
+            xs_pad, masks, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen) = encoder_layer(xs_pad, masks, dialectid=dialectid)
+            all_macaron_expert_probs.append(macaron_expert_probs)
+            all_macaron_expert_chosen.append(macaron_expert_chosen)
+            all_expert_probs.append(expert_probs)
+            all_expert_chosen.append(expert_chosen)
 
         if isinstance(xs_pad, tuple):
             xs_pad = xs_pad[0]

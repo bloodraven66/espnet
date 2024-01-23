@@ -304,6 +304,12 @@ class ASRTask(AbsTask):
             help="Use natural language phrases as prompt",
         )
         group.add_argument(
+            "--use_dialectid",
+            type=str2bool,
+            default=False,
+            help="Use utterance level dialect ID",
+        )
+        group.add_argument(
             "--token_type",
             type=str,
             default="bpe",
@@ -492,7 +498,7 @@ class ASRTask(AbsTask):
         MAX_REFERENCE_NUM = 4
 
         retval = ["text_spk{}".format(n) for n in range(2, MAX_REFERENCE_NUM + 1)]
-        retval = retval + ["prompt"]
+        retval = retval + ["prompt"] + ["dialectid"]
         retval = tuple(retval)
 
         logging.info(f"Optional Data Names: {retval }")

@@ -245,16 +245,20 @@ class ESPnetASRModel(AbsESPnetModel):
             == text_lengths.shape[0]
         ), (speech.shape, speech_lengths.shape, text.shape, text_lengths.shape)
         batch_size = speech.shape[0]
-
         text[text == -1] = self.ignore_id
 
         # for data-parallel
         text = text[:, : text_lengths.max()]
 
         # 1. Encoder
-        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
-        if self.encoder.moe:
-           encoder_out, moe_out = encoder_out
+        if "dialectid" in kwargs:
+            encoder_out, encoder_out_lens = self.encode(speech, speech_lengths,kwargs["dialectid"])
+        else:
+            encoder_out, encoder_out_lens = self.encode(speech, speech_lengths,)
+        
+        if hasattr(self.encoder, "moe"):
+            if self.encoder.moe:
+                encoder_out, moe_out = encoder_out
         intermediate_outs = None
         if isinstance(encoder_out, tuple):
             intermediate_outs = encoder_out[1]
@@ -352,26 +356,29 @@ class ESPnetASRModel(AbsESPnetModel):
                     encoder_out, encoder_out_lens, text, text_lengths
                 )
             moe_loss = 0
-            if self.encoder.moe:
-                _moe_loss = self._calc_moe_loss(moe_out[2], moe_out[3])
-                moe_loss += _moe_loss
-                stats["moe_lb"] = _moe_loss
-            if self.encoder.macaron_moe:
-                macaron_moe_loss = self._calc_moe_loss(moe_out[0], moe_out[1])
-                moe_loss += macaron_moe_loss
-                stats["macaron_moe_lb"] = macaron_moe_loss
+            if hasattr(self.encoder, "moe"):
+                if self.encoder.moe:
+                    _moe_loss = self._calc_moe_loss(moe_out[2], moe_out[3])
+                    moe_loss += _moe_loss
+                    stats["moe_lb"] = _moe_loss
+                if self.encoder.macaron_moe:
+                    macaron_moe_loss = self._calc_moe_loss(moe_out[0], moe_out[1])
+                    moe_loss += macaron_moe_loss
+                    stats["macaron_moe_lb"] = macaron_moe_loss
                 
             # 3. CTC-Att loss definition
             if self.ctc_weight == 0.0:
                 loss = loss_att
             elif self.ctc_weight == 1.0:
-                if self.encoder.moe:
-                    loss = loss_ctc + moe_loss
+                if hasattr(self.encoder, "moe"):
+                    if self.encoder.moe:
+                        loss = loss_ctc + moe_loss
                 else:
                     loss = loss_ctc
             else:
-                if self.encoder.moe:
-                    loss = self.ctc_weight * (loss_ctc + moe_loss) + (1 - self.ctc_weight) * loss_att
+                if hasattr(self.encoder, "moe"):
+                    if self.encoder.moe:
+                        loss = self.ctc_weight * (loss_ctc + moe_loss) + (1 - self.ctc_weight) * loss_att
                 else:
                     loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_att
 
@@ -400,7 +407,7 @@ class ESPnetASRModel(AbsESPnetModel):
         return {"feats": feats, "feats_lengths": feats_lengths}
 
     def encode(
-        self, speech: torch.Tensor, speech_lengths: torch.Tensor
+        self, speech: torch.Tensor, speech_lengths: torch.Tensor, dialectid=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Frontend + Encoder. Note that this method is used by asr_inference.py
 
@@ -438,8 +445,11 @@ class ESPnetASRModel(AbsESPnetModel):
                     feats, feats_lengths, ctc=self.ctc
                 )
         else:
-            if self.encoder.moe:
-                encoder_out, encoder_out_lens, _, moe_out = self.encoder(feats, feats_lengths)
+            if hasattr(self.encoder, "moe"):
+                if self.encoder.moe:
+                    encoder_out, encoder_out_lens, _, moe_out = self.encoder(feats, feats_lengths, dialectid=dialectid)
+                else:
+                    encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_lengths)
             else:
                 encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_lengths)
         intermediate_outs = None
@@ -479,9 +489,9 @@ class ESPnetASRModel(AbsESPnetModel):
             if self.encoder.moe:
                 return (encoder_out, intermediate_outs, moe_out), encoder_out_lens
             return (encoder_out, intermediate_outs), encoder_out_lens
-
-        if self.encoder.moe:
-            return (encoder_out, moe_out), encoder_out_lens
+        if hasattr(self.encoder, "moe"):
+            if self.encoder.moe:
+                return (encoder_out, moe_out), encoder_out_lens
         return encoder_out, encoder_out_lens
 
     def _extract_feats(

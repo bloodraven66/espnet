@@ -15,37 +15,15 @@ test_sets="$lang"/"test_bh_asru"
 #test_sets="test_clean"
 
 # asr_config=conf/gs_moe/train_conformer_ctc_dense_moe_noMacaronMoe-1024dim_yesNormalMoe-1024dim-4experts_utt_mix-gs-moe-sum-soft.yaml
-asr_config="conf/gs_moe/train_conformer_ctc_dense_moe_noMacaronMoe-1024dim_yesNormalMoe-1024dim-4experts_utt_mix-gs-moe-sum-soft-0.3tau.yaml"
-# inference_config=conf/decode_asr_moebs.yaml
+# asr_config="conf/dialectid/train_conformer_ctc_dense_moe_noMacaronMoe-1024dim_yesNormalMoe-682dim-num_dialect_experts.yaml"
+asr_config=conf/dialectid/train_conformer_ctc_dense_moe_noMacaronMoe-1024dim_yesNormalMoe-128dim-num_dialect_experts3_plusGlobalExpert1024.yaml
+inference_config=conf/decode_asr.yaml
 
-# inference_config=conf/decode_asr.yaml
-# ./asr.sh \
-#     --lang "$lang" \
-#     --ngpu 1 \
-#     --nj 48 \
-#     --stage 12 \
-#     --gpu_inference true \
-#     --inference_nj 32 \
-#     --token_type char \
-#     --max_wav_duration 30 \
-#     --audio_format "wav" \
-#     --feats_type raw_copy \
-#     --use_lm true \
-#     --asr_config "${asr_config}" \
-#     --inference_config "${inference_config}" \
-#     --train_set "${train_set}" \
-#     --valid_set "${valid_set}" \
-#     --test_sets "${test_sets}" \
-#     --inference_asr_model "valid.cer_ctc.ave_3best.pth" \
-#     --inference_tag "hard_decode" \
-#     --lm_train_text "data/${train_set}/text" \
-
-inference_config=conf/decode_asr_moebs.yaml
 ./asr.sh \
     --lang "$lang" \
     --ngpu 1 \
     --nj 48 \
-    --stage 12 \
+    --stage 11 \
     --gpu_inference true \
     --inference_nj 32 \
     --token_type char \
@@ -59,7 +37,8 @@ inference_config=conf/decode_asr_moebs.yaml
     --valid_set "${valid_set}" \
     --test_sets "${test_sets}" \
     --inference_asr_model "valid.cer_ctc.ave_3best.pth" \
-    --inference_tag "hard_decode_moebs20_19" \
+    --inference_tag "decode" \
     --lm_train_text "data/${train_set}/text" \
-    --use_moebs_decoding true 
+    --use_dialectid true \
+
 
