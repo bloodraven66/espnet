@@ -28,6 +28,10 @@ encoder_conf:
     activation_type: swish
     use_cnn_module: true
     cnn_module_kernel: 31
+    layerdialectembed: true
+    layerdialectembeddim: 32
+    num_dialects: 5
+    layerembedpred: true
 
 model_conf:
     ctc_weight: 1.0

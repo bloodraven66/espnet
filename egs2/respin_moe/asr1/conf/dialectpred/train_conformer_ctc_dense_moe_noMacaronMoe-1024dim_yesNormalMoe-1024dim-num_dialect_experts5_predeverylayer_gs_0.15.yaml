@@ -1,5 +1,5 @@
 batch_type: numel
-batch_bins: 4000000
+batch_bins: 3000000
 accum_grad: 8
 max_epoch: 20
 patience: none
@@ -10,11 +10,12 @@ best_model_criterion:
     - min
 keep_nbest_models: 3
 
-encoder: conformer
+encoder: conformer_moe
 encoder_conf:
     output_size: 256
     attention_heads: 4
-    linear_units: 1024
+    linear_units: [1024,1024,1024,1024,1024]
+    macaron_style_linear_units: 1024
     num_blocks: 18
     dropout_rate: 0.1
     positional_dropout_rate: 0.1
@@ -28,6 +29,15 @@ encoder_conf:
     activation_type: swish
     use_cnn_module: true
     cnn_module_kernel: 31
+    positionwise_layer_type: guided_utt_moe
+    macaron_positionwise_layer_type: linear
+    num_experts: 5
+    use_dialect_id: false
+    use_expert_predictor: true
+    dialect_pred_loss: true
+    gs: true
+    gs_mode: soft
+    tau: 0.15
 
 model_conf:
     ctc_weight: 1.0

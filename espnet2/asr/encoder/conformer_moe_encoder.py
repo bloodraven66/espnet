@@ -90,6 +90,7 @@ class PositionwiseFeedForwardMoE(torch.nn.Module):
         x = x.view(-1, dim)
         capacity = int(self.capacity_factor * bs * ts / self.num_experts)
         
+        
         probs = self.softmax(self.expert_predictor(x))
         expert_probs, expert_chosen = torch.topk(probs, 1, -1)
         final_output = x.new_zeros(x.shape)
@@ -127,7 +128,8 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
                 split_dims=False,
                 use_expert_predictor=True,
                 global_expert=False,
-                global_expert_dim=512
+                global_expert_dim=512,
+                expert_predictor_extra_dims=0
                 ):
         """Construct an PositionwiseFeedForward object."""
         super(PositionwiseFeedForwardUttMoE, self).__init__()
@@ -143,7 +145,7 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
             ),
         )
         if use_expert_predictor:
-            self.expert_predictor = torch.nn.Linear(idim, num_experts)
+            self.expert_predictor = torch.nn.Linear(idim+expert_predictor_extra_dims, num_experts)
         self.softmax = torch.nn.Softmax(dim=-1)
         self.num_experts = num_experts
         self.capacity_factor = capacity_factor
@@ -162,15 +164,22 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
                 idim // 2,
             )
         
-    def forward(self, x, change_expert=None, hard_gs_decoding=False, custom_expert_chosen=None):
+    def forward(self, x, change_expert=None, hard_gs_decoding=False, custom_expert_chosen=None, concat_embed=None):
         """Forward function."""
         bs, ts, dim = x.shape      
+        residual = x
         if custom_expert_chosen is None:      
-            probs = self.softmax(self.expert_predictor(torch.mean(x, 1)))
+            feat = torch.mean(x, 1)
+            if concat_embed is not None:
+                concat_embed = concat_embed.view(concat_embed.shape[0], -1)
+                feat = torch.cat([feat, concat_embed], -1)
+                
+            probs = self.softmax(self.expert_predictor(feat))
         else:
             probs = torch.full((bs, 1), fill_value=1.0, device=x.device)
             
         if self.gs:
+            # print('gs')
             probs, expert_chosen = gumbel_softmax(probs, mode=self.gs_mode, tau=self.tau)
             if hard_gs_decoding:
                 argmax_out = probs.argmax(-1)
@@ -195,6 +204,7 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
                     # final_output = torch.stack(all_expert_outputs, -1).mean(-1)
                     final_output = torch.stack(all_expert_outputs, -1).sum(-1)
         else:
+            
             if custom_expert_chosen is None:
                 expert_probs, expert_chosen = torch.topk(probs, 1, -1)
                 
@@ -221,14 +231,24 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
         if self.global_expert:
             global_expert_vals = self.global_expert(x)
             final_output = torch.cat([global_expert_vals, final_output], -1)
-            
 
         return final_output, probs.view(bs, -1), expert_chosen.view(bs, -1)
     
-    def bs_decoder(self, x, local_bw, expert_history, expert_idx_history, residual):
-        bs, ts, dim = x.shape            
-        probs = self.softmax(self.expert_predictor(torch.mean(x, 1)))
-        probs, expert_chosen = gumbel_softmax(probs, mode=self.gs_mode, tau=self.tau)
+    def bs_decoder(self, x, local_bw, expert_history, expert_idx_history, residual, custom_expert_chosen, concat_embed=None):
+        bs, ts, dim = x.shape        
+        assert custom_expert_chosen is None
+        assert not self.gs
+        if self.gs:    
+            probs = self.softmax(self.expert_predictor(torch.mean(x, 1)))
+            probs, expert_chosen = gumbel_softmax(probs, mode=self.gs_mode, tau=self.tau)
+        else:
+            feat = torch.mean(x, 1)
+            if concat_embed is not None:
+                concat_embed = concat_embed.view(concat_embed.shape[0], -1)
+                concat_embed = concat_embed.repeat(feat.shape[0], 1)
+                feat = torch.cat([feat, concat_embed], -1)
+            probs = self.softmax(self.expert_predictor(feat))
+            
         num_experts = probs.shape[-1]
         local_topk_out = torch.topk(probs, min(local_bw, num_experts), -1)
         local_topk_values = torch.log(local_topk_out.values.squeeze())
@@ -259,11 +279,29 @@ class PositionwiseFeedForwardUttMoE(torch.nn.Module):
             x_idx, expert_idx = idx
             residual_.append(residual[x_idx])
             res = self.experts[expert_idx](x[x_idx])
+            if self.global_expert:
+                global_expert_vals = self.global_expert(x[x_idx])
+                res = torch.cat([global_expert_vals, res], -1)
             res_.append(res)
         if rename:
             expert_idx_history[-1] = [(idx, x) for idx, x in enumerate(global_topk_indices)]
+            # print(global_topk_values)
+            # print(selected_ids)
+            # print(global_values.shape, global_topk_indices)
+            
+            # num_avg = 2
+            # _res = torch.stack(res_[:num_avg], 0).mean(0)
+            # res_ = [_res] + res_[num_avg:]
+            # expert_idx_history[-1] = [(0,0)] + [(x+1, global_topk_indices[num_avg+x]) for x in range(0, len(global_topk_indices)-num_avg)]
+            # residual_avg = torch.stack(residual_[:num_avg], 0).mean(0)
+            # residual_ = [residual_avg] + residual_[num_avg:]            
+            # expert_history[-1] = torch.cat([expert_history[-1][:num_avg].mean().reshape(1), expert_history[-1][num_avg:]], 0)
+            
         residual = torch.stack(residual_, 0)
         final_output = torch.stack(res_, 0)
+        
+        # print(expert_idx_history[-1])
+        # print('--')
         return final_output, expert_history, expert_idx_history, residual
     
 class ConformerMoEEncoderLayer(torch.nn.Module):
@@ -333,7 +371,7 @@ class ConformerMoEEncoderLayer(torch.nn.Module):
             self.concat_linear = nn.Linear(size + size, size)
         self.stochastic_depth_rate = stochastic_depth_rate
 
-    def forward(self, x_input, mask, dialectid=None, cache=None):
+    def forward(self, x_input, mask, dialectid=None, cache=None, dialectembed=None):
         """Compute encoded features.
 
         Args:
@@ -427,7 +465,7 @@ class ConformerMoEEncoderLayer(torch.nn.Module):
         if self.moe:
             if dialectid is not None:
                 dialectid = dialectid.squeeze() - 1
-            x, expert_probs, expert_chosen = self.feed_forward(x, custom_expert_chosen=dialectid) 
+            x, expert_probs, expert_chosen = self.feed_forward(x, custom_expert_chosen=dialectid, concat_embed=dialectembed) 
         else:
             x = self.feed_forward(x) 
             expert_probs, expert_chosen = [], []
@@ -446,7 +484,7 @@ class ConformerMoEEncoderLayer(torch.nn.Module):
 
         return x, mask, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen)
 
-    def bs_decoder(self, x_input, mask, local_bw, cache=None, expert_history=None, expert_idx_history=None):
+    def bs_decoder(self, x_input, mask, local_bw, cache=None, expert_history=None, expert_idx_history=None, dialectid=None, dialectembed=None):
         
         if isinstance(x_input, tuple):
             x, pos_emb = x_input[0], x_input[1]
@@ -496,7 +534,16 @@ class ConformerMoEEncoderLayer(torch.nn.Module):
         if self.normalize_before:
             x = self.norm_ff(x)
             
-        x, expert_history, expert_idx_history, residual = self.feed_forward.bs_decoder(x, local_bw=local_bw, expert_history=expert_history, expert_idx_history=expert_idx_history, residual=residual) 
+        x, expert_history, expert_idx_history, residual = self.feed_forward.bs_decoder(
+            x, 
+            local_bw=local_bw, 
+            expert_history=expert_history, 
+            expert_idx_history=expert_idx_history, 
+            residual=residual,
+            custom_expert_chosen=dialectid, 
+            concat_embed=dialectembed,
+            
+        ) 
         x = residual + stoch_layer_coeff * self.ff_scale * self.dropout(x)
         if not self.normalize_before:
             x = self.norm_ff(x)
@@ -589,7 +636,15 @@ class ConformerEncoderMoe(AbsEncoder):
         use_dialect_id: bool = False,
         use_expert_predictor: bool = True,
         global_expert: bool = False,
-        global_expert_dim: int = 512
+        global_expert_dim: int = 512,
+        dialect_pred_loss: bool = False,
+        dialectembed: bool = False,
+        dialectembeddim: int = 32,
+        layerdialectembed: bool = False,
+        layerdialectembeddim: int = 32,
+        num_dialects: int = 0,
+        layerembedpred: bool = False,
+        embedpred: bool = False,
         
     ):
         assert check_argument_types()
@@ -710,13 +765,14 @@ class ConformerEncoderMoe(AbsEncoder):
                 capacity_factor,
                 dropout_rate,
                 activation,
-                False,
+                gs,
                 gs_mode,
                 tau,
                 False,
                 use_expert_predictor,
                 global_expert,
                 global_expert_dim,
+                0 if not dialectembed else dialectembeddim
                 
             )
         elif positionwise_layer_type == "utt_moe":
@@ -752,7 +808,10 @@ class ConformerEncoderMoe(AbsEncoder):
                 gs_mode,
                 tau,
                 False,
-                use_expert_predictor
+                use_expert_predictor,
+                global_expert,
+                global_expert_dim,
+                0 if not dialectembed else dialectembeddim
                 )
         else:
             raise NotImplementedError("Support only linear or moe.")
@@ -849,6 +908,25 @@ class ConformerEncoderMoe(AbsEncoder):
             assert 0 < min(interctc_layer_idx) and max(interctc_layer_idx) < num_blocks
         self.interctc_use_conditioning = interctc_use_conditioning
         self.conditioning_layer = None
+        self.use_dialect_id = use_dialect_id
+        self.dialect_pred_loss = dialect_pred_loss
+        
+        self.dialectembed = None
+        self.embedpred = None
+        if dialectembed:
+            self.dialectembed = torch.nn.Embedding(num_experts, dialectembeddim)
+            if embedpred:
+                self.embedpred = torch.nn.Linear(output_size, num_dialects)
+                self.softmax = torch.nn.Softmax(dim=-1)
+        
+        self.layerdialectembed = None
+        self.layerembedpred = None
+        if layerdialectembed:
+            self.proj_back = torch.nn.Linear(output_size+layerdialectembeddim, output_size)
+            self.layerdialectembed = torch.nn.Embedding(num_dialects, layerdialectembeddim)
+            if layerembedpred:
+                self.softmax = torch.nn.Softmax(dim=-1)
+                self.layerembedpred = torch.nn.Linear(output_size, num_dialects)
 
     def output_size(self) -> int:
         return self._output_size
@@ -858,6 +936,7 @@ class ConformerEncoderMoe(AbsEncoder):
         xs_pad: torch.Tensor,
         ilens: torch.Tensor,
         bw,
+        dialectid=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         
         masks = (~make_pad_mask(ilens)[:, None, :]).to(xs_pad.device)
@@ -879,6 +958,30 @@ class ConformerEncoderMoe(AbsEncoder):
         else:
             xs_pad = self.embed(xs_pad)
         
+        if self.layerdialectembed is not None:
+            xs_pad_, other = xs_pad
+            if self.layerembedpred is not None:
+                dialectpred = self.layerembedpred(xs_pad_.sum(1) / masks.view(masks.shape[0], -1).sum(1)[:, None])
+                dialectlabel = torch.argmax(self.softmax(dialectpred).detach(), 1).unsqueeze(1)
+            else:
+                dialectlabel = dialectid - 1
+                
+            xs_pad_ = torch.cat([xs_pad_, self.layerdialectembed(dialectlabel).repeat(1, xs_pad_.shape[1], 1)], dim=-1)
+            xs_pad_ = self.proj_back(xs_pad_)
+            xs_pad = (xs_pad_, other)
+        dialectembed, dialectid_ = None, None
+        if self.use_dialect_id:
+            dialectid_ = dialectid
+        
+        if self.dialectembed:
+            if self.embedpred is not None:
+                dialectpred = self.embedpred(xs_pad[0].sum(1) / masks.view(masks.shape[0], -1).sum(1)[:, None])
+                dialectlabel = torch.argmax(self.softmax(dialectpred).detach(), 1).unsqueeze(1)
+            else:
+                dialectlabel = dialectid - 1
+            dialectembed = self.dialectembed(dialectlabel)
+            
+        
         intermediate_outs = []
         all_macaron_expert_probs = []
         all_macaron_expert_chosen = []
@@ -887,7 +990,15 @@ class ConformerEncoderMoe(AbsEncoder):
         expert_idx_history = None
         expert_history = None
         for layer_idx, encoder_layer in enumerate(self.encoders):
-            xs_pad, masks, expert_history, expert_idx_history = encoder_layer.bs_decoder(xs_pad, masks, local_bw=bw, expert_idx_history=expert_idx_history, expert_history=expert_history)
+            xs_pad, masks, expert_history, expert_idx_history = encoder_layer.bs_decoder(
+                xs_pad, 
+                masks, 
+                local_bw=bw, 
+                expert_idx_history=expert_idx_history, 
+                expert_history=expert_history,
+                dialectid=dialectid_,
+                dialectembed=dialectembed,
+            )
         
         if isinstance(xs_pad, tuple):
             xs_pad = xs_pad[0]
@@ -905,21 +1016,7 @@ class ConformerEncoderMoe(AbsEncoder):
         ctc: CTC = None,
         dialectid=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Calculate forward propagation.
-
-        Args:
-            xs_pad (torch.Tensor): Input tensor (#batch, L, input_size).
-            ilens (torch.Tensor): Input length (#batch).
-            prev_states (torch.Tensor): Not to be used now.
-
-        Returns:
-            torch.Tensor: Output tensor (#batch, L, output_size).
-            torch.Tensor: Output length (#batch).
-            torch.Tensor: Not to be used now.
-
-        """
         masks = (~make_pad_mask(ilens)[:, None, :]).to(xs_pad.device)
-
         if (
             isinstance(self.embed, Conv2dSubsampling)
             or isinstance(self.embed, Conv2dSubsampling2)
@@ -937,15 +1034,36 @@ class ConformerEncoderMoe(AbsEncoder):
             xs_pad, masks = self.embed(xs_pad, masks)
         else:
             xs_pad = self.embed(xs_pad)
+        
+        if self.layerdialectembed is not None:
+            xs_pad_, other = xs_pad
+            if self.layerembedpred is not None:
+                dialectpred = self.layerembedpred(xs_pad_.sum(1) / masks.view(masks.shape[0], -1).sum(1)[:, None])
+                dialectlabel = torch.argmax(self.softmax(dialectpred).detach(), 1).unsqueeze(1)
+            else:
+                dialectlabel = dialectid - 1
+                
+            xs_pad_ = torch.cat([xs_pad_, self.layerdialectembed(dialectlabel).repeat(1, xs_pad_.shape[1], 1)], dim=-1)
+            xs_pad_ = self.proj_back(xs_pad_)
+            xs_pad = (xs_pad_, other)
+            
 
-        intermediate_outs = []
-        all_macaron_expert_probs = []
-        all_macaron_expert_chosen = []
-        all_expert_probs = []
-        all_expert_chosen = []
+        intermediate_outs, all_macaron_expert_probs, all_macaron_expert_chosen, all_expert_probs, all_expert_chosen = [], [], [], [], []
             # xs_pad, masks = self.encoders(xs_pad, masks)
+        dialectid_, dialectembed = None, None
+        if self.use_dialect_id:
+            dialectid_ = dialectid
+        
+        if self.dialectembed:
+            if self.embedpred is not None:
+                dialectpred = self.embedpred(xs_pad[0].sum(1) / masks.view(masks.shape[0], -1).sum(1)[:, None])
+                dialectlabel = torch.argmax(self.softmax(dialectpred).detach(), 1).unsqueeze(1)
+            else:
+                dialectlabel = dialectid - 1
+            dialectembed = self.dialectembed(dialectlabel)
+            
         for layer_idx, encoder_layer in enumerate(self.encoders):
-            xs_pad, masks, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen) = encoder_layer(xs_pad, masks, dialectid=dialectid)
+            xs_pad, masks, (macaron_expert_probs, macaron_expert_chosen), (expert_probs, expert_chosen) = encoder_layer(xs_pad, masks, dialectid=dialectid_, dialectembed=dialectembed)
             all_macaron_expert_probs.append(macaron_expert_probs)
             all_macaron_expert_chosen.append(macaron_expert_chosen)
             all_expert_probs.append(expert_probs)
@@ -959,5 +1077,7 @@ class ConformerEncoderMoe(AbsEncoder):
         olens = masks.squeeze(1).sum(1)
         if len(intermediate_outs) > 0:
             return (xs_pad, intermediate_outs), olens, None, (all_macaron_expert_probs, all_macaron_expert_chosen), (all_expert_probs, all_expert_chosen)
+        if self.layerembedpred is not None or self.embedpred is not None:
+            return (xs_pad, intermediate_outs), olens, None, (all_macaron_expert_probs, all_macaron_expert_chosen, all_expert_probs, all_expert_chosen), dialectpred
         return xs_pad, olens, None, (all_macaron_expert_probs, all_macaron_expert_chosen, all_expert_probs, all_expert_chosen)
 

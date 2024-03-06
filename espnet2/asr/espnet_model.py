@@ -216,7 +216,14 @@ class ESPnetASRModel(AbsESPnetModel):
                 print(f"Training Total Params - {total_count}M")
                 print(moe_layer_count)
                 print(f"Inference Params with {self.encoder.num_experts} experts - {inference_count}M")
-        
+        self.dialectpredloss = None
+        self.dialectembedpredloss = None
+        if hasattr(self.encoder, "dialect_pred_loss"):
+            if self.encoder.dialect_pred_loss:
+                self.dialectpredloss = torch.nn.NLLLoss()
+        if hasattr(self.encoder, "layerembedpred"):
+            if self.encoder.layerembedpred is not None or self.encoder.embedpred is not None:
+                self.dialectembedpredloss = torch.nn.CrossEntropyLoss()
 
 
     def forward(
@@ -255,10 +262,18 @@ class ESPnetASRModel(AbsESPnetModel):
             encoder_out, encoder_out_lens = self.encode(speech, speech_lengths,kwargs["dialectid"])
         else:
             encoder_out, encoder_out_lens = self.encode(speech, speech_lengths,)
-        
+        dialect_pred = None
         if hasattr(self.encoder, "moe"):
             if self.encoder.moe:
-                encoder_out, moe_out = encoder_out
+                if self.encoder.layerembedpred is not None or self.encoder.embedpred is not None:
+                    encoder_out, moe_out, dialect_pred = encoder_out
+                else:
+                    encoder_out, moe_out = encoder_out
+        else:
+            if hasattr(self.encoder, "layerembedpred"):
+                if self.encoder.layerembedpred is not None:
+                    encoder_out, dialect_pred = encoder_out
+                    
         intermediate_outs = None
         if isinstance(encoder_out, tuple):
             intermediate_outs = encoder_out[1]
@@ -365,6 +380,9 @@ class ESPnetASRModel(AbsESPnetModel):
                     macaron_moe_loss = self._calc_moe_loss(moe_out[0], moe_out[1])
                     moe_loss += macaron_moe_loss
                     stats["macaron_moe_lb"] = macaron_moe_loss
+            
+            
+                
                 
             # 3. CTC-Att loss definition
             if self.ctc_weight == 0.0:
@@ -381,6 +399,27 @@ class ESPnetASRModel(AbsESPnetModel):
                         loss = self.ctc_weight * (loss_ctc + moe_loss) + (1 - self.ctc_weight) * loss_att
                 else:
                     loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_att
+            
+            if self.dialectembedpredloss is not None:
+                dialectembedpredloss = self.dialectembedpredloss(dialect_pred, kwargs["dialectid"].squeeze()-1)
+                stats["dialectpredloss"] = dialectembedpredloss
+                loss += dialectembedpredloss
+                probs = torch.nn.functional.softmax(dialect_pred, dim=1)
+                correct = torch.argmax(probs, dim=1) == (kwargs["dialectid"].squeeze()-1).squeeze()
+                accuracy = torch.sum(correct).float() / float(correct.shape[0])
+                stats["dialectpredacc"] = accuracy
+                
+            if self.dialectpredloss is not None:
+                log_probs = torch.log(torch.stack(moe_out[2], -1))
+                labels = (kwargs["dialectid"]-1).repeat(1, log_probs.shape[-1])
+                dialectpredloss = self.dialectpredloss(log_probs, labels) * len(moe_out[2])
+                stats["dialectpredloss"] = dialectpredloss
+                loss += dialectpredloss
+                layer_wise_correct = torch.argmax(log_probs, dim=1) == labels
+                accuracy = torch.sum(layer_wise_correct).float() / float(layer_wise_correct.shape[0]*layer_wise_correct.shape[1])
+                # layer_wise_accuracy = torch.sum(layer_wise_correct, dim=0).float() / float(layer_wise_correct.shape[0])
+                stats["dialectpredacc"] = accuracy
+                    
 
             # Collect Attn branch stats
             stats["loss_att"] = loss_att.detach() if loss_att is not None else None
@@ -434,6 +473,7 @@ class ESPnetASRModel(AbsESPnetModel):
         # 4. Forward encoder
         # feats: (Batch, Length, Dim)
         # -> encoder_out: (Batch, Length2, Dim2)
+        dialect_pred = None
         if self.encoder.interctc_use_conditioning:
             if self.encoder.moe:
                 
@@ -447,11 +487,24 @@ class ESPnetASRModel(AbsESPnetModel):
         else:
             if hasattr(self.encoder, "moe"):
                 if self.encoder.moe:
-                    encoder_out, encoder_out_lens, _, moe_out = self.encoder(feats, feats_lengths, dialectid=dialectid)
+                    if self.encoder.layerembedpred is not None or self.encoder.embedpred is not None:
+                        
+                        encoder_out, encoder_out_lens, _, moe_out, dialect_pred  = self.encoder(feats, feats_lengths, dialectid=dialectid)
+                    else:
+                        encoder_out, encoder_out_lens, _, moe_out = self.encoder(feats, feats_lengths, dialectid=dialectid)
                 else:
                     encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_lengths)
             else:
-                encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_lengths)
+                if hasattr(self.encoder, "proj_back"):
+                    if hasattr(self.encoder, "layerembedpred"):
+                        if self.encoder.layerembedpred is not None:
+                            encoder_out, encoder_out_lens, _, dialect_pred = self.encoder(feats, feats_lengths, dialectid=dialectid)
+                        else:
+                            encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_lengths, dialectid=dialectid)
+                    else:
+                        encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_lengths, dialectid=dialectid)
+                else:
+                    encoder_out, encoder_out_lens, _ = self.encoder(feats, feats_lengths)
         intermediate_outs = None
         if isinstance(encoder_out, tuple):
             intermediate_outs = encoder_out[1]
@@ -484,14 +537,19 @@ class ESPnetASRModel(AbsESPnetModel):
                     encoder_out[0].size(),
                     encoder_out_lens.max(),
                 )
-
-        if intermediate_outs is not None:
-            if self.encoder.moe:
-                return (encoder_out, intermediate_outs, moe_out), encoder_out_lens
-            return (encoder_out, intermediate_outs), encoder_out_lens
+        
+        # if intermediate_outs is not None:
+        #     print(intermediate_outs)
+        #     if self.encoder.moe:
+        #         return (encoder_out, intermediate_outs, moe_out), encoder_out_lens
+        #     return (encoder_out, intermediate_outs), encoder_out_lens
         if hasattr(self.encoder, "moe"):
             if self.encoder.moe:
+                if dialect_pred is not None:
+                    return (encoder_out, moe_out, dialect_pred), encoder_out_lens
                 return (encoder_out, moe_out), encoder_out_lens
+        if dialect_pred is not None:
+            return (encoder_out, dialect_pred), encoder_out_lens
         return encoder_out, encoder_out_lens
 
     def _extract_feats(

@@ -98,6 +98,7 @@ class Speech2Text:
         hugging_face_decoder_max_length: int = 256,
         time_sync: bool = False,
         multi_asr: bool = False,
+        dialectid: Optional[str] = None,
     ):
         assert check_argument_types()
 
@@ -281,7 +282,7 @@ class Speech2Text:
 
     @torch.no_grad()
     def __call__(
-        self, speech: Union[torch.Tensor, np.ndarray]
+        self, speech: Union[torch.Tensor, np.ndarray], dialectid=None,
     ) -> List[
         Tuple[
             Optional[str],
@@ -307,6 +308,8 @@ class Speech2Text:
         speech_lengths = speech.new_full([1], dtype=torch.long, fill_value=speech.size(1))
         batch = {"speech": speech, "speech_lengths": speech_lengths}
         logging.info("speech length: " + str(speech.size(1)))
+        if dialectid is not None:
+            batch["dialectid"] = dialectid
         batch = to_device(batch, device=self.device)
         # enc, _ = self.asr_model.encode(**batch)
         
@@ -320,15 +323,48 @@ class Speech2Text:
         if self.asr_model.preencoder is not None:
             feats, feats_lengths = self.asr_model.preencoder(feats, feats_lengths)
         
-        bw = 20
-        encoder_out, encoder_out_lens, _, moe_out = self.asr_model.encoder.bs_decoder(feats, feats_lengths, bw)
+        bw = 8
+        encoder_out, encoder_out_lens, _, moe_out = self.asr_model.encoder.bs_decoder(feats, feats_lengths, bw, batch["dialectid"])
 
         if self.asr_model.postencoder is not None:
             encoder_out, encoder_out_lens = self.asr_model.postencoder(
                 encoder_out, encoder_out_lens
             )
         #select beam
-        encoder_out = encoder_out[19].unsqueeze(0)
+        
+        
+        ##score all expert bs hyp
+        # from multiprocessing import Pool, set_start_method
+        # torch.cuda.init()
+        # try:
+        #     set_start_method('spawn')
+        # except:
+        #     pass
+        # from tqdm import tqdm
+        # with Pool(bw) as p:
+        #     all_results = list(tqdm(p.imap(self._decode_single_sample, encoder_out), total=len(encoder_out)))
+        # scores = [res[0][3].score for res in all_results]
+        
+        scores = []
+        all_results = []
+        for idx in range(len(encoder_out)):
+            res = self._decode_single_sample(encoder_out[idx])
+            all_results.append(res)
+            scores.append(res[0][3].score)
+        max_score = max(scores)
+        max_score_idx = scores.index(max_score)
+        logging.info("All scores: " + ' '.join([str(s) for s in scores]))
+        logging.info("Selected index: " + str(max_score_idx))
+        results = all_results[max_score_idx]
+        assert check_return_type(results)
+        return results
+        
+        
+        ##normal decoding
+        
+        encoder_out = encoder_out[0].unsqueeze(0)
+        
+        # encoder_out = encoder_out[:2].mean(0).unsqueeze(0)
         
         
         assert encoder_out.size(0) == speech.size(0), (
@@ -454,6 +490,7 @@ def inference(
     time_sync: bool,
     multi_asr: bool,
     moe_beam_size: int,
+    dialectid: Optional[str]
 ):
     assert check_argument_types()
     if batch_size > 1:
@@ -506,6 +543,7 @@ def inference(
         hugging_face_decoder=hugging_face_decoder,
         hugging_face_decoder_max_length=hugging_face_decoder_max_length,
         time_sync=time_sync,
+        dialectid=dialectid,
     )
     speech2text = Speech2Text.from_pretrained(
         model_tag=model_tag,
@@ -527,6 +565,7 @@ def inference(
 
     # 7 .Start for-loop
     # FIXME(kamo): The output format should be discussed about
+    print(output_dir)
     with DatadirWriter(output_dir) as writer:
         for keys, batch in loader:
             assert isinstance(batch, dict), type(batch)
@@ -694,6 +733,12 @@ def get_parser():
         type=str2bool,
         default=False,
         help="Apply dynamic quantization to ASR model.",
+    )
+    group.add_argument(
+        "--dialectid",
+        type=str,
+        default=None,
+        help="dialectid file",
     )
     group.add_argument(
         "--quantize_lm",
